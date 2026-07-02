@@ -67,6 +67,10 @@ class ParaHand:
         self._motor_feedback: Dict[int, Dict[str, Any]] = {}
         self._poll_stop_event = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
+        self._poll_failure_counts: Dict[int, int] = {}
+        self._poll_next_allowed_at: Dict[int, float] = {}
+        self._poll_bus_pause_until: float = 0.0
+        self._poll_cursor = 0
         self._callbacks_registered = False
         self.ctrl_frequency = self._parse_ctrl_frequency(self.config.get("ctrl_frequency", 50))
         self.joint_to_motor: Dict[str, JointDefinition] = {}
@@ -96,6 +100,11 @@ class ParaHand:
             motor_ok = self.motor.connect()
             if motor_ok:
                 self._register_callbacks()
+
+        self._poll_failure_counts.clear()
+        self._poll_next_allowed_at.clear()
+        self._poll_bus_pause_until = 0.0
+        self._poll_cursor = 0
 
         if self.tactile_config.enabled:
             self.start_tactile()
@@ -693,10 +702,31 @@ class ParaHand:
         if not self.motor.connected:
             raise RuntimeError("未连接到电机控制系统")
 
+        now = time.monotonic()
+        if now < self._poll_bus_pause_until:
+            return {}
+
+        ordered_motor_ids = list(self._poll_motor_ids())
+        if not ordered_motor_ids:
+            return {}
+
+        start_index = self._poll_cursor % len(ordered_motor_ids)
+        motor_ids = ordered_motor_ids[start_index:] + ordered_motor_ids[:start_index]
+        self._poll_cursor = (start_index + 1) % len(ordered_motor_ids)
+
         updated_feedback: Dict[int, Dict[str, Any]] = {}
-        for motor_id in self._poll_motor_ids():
-            status = self.motor.get_motor_status(motor_id, sync=True, timeout=1.0 / self.ctrl_frequency)
-            updated_feedback[motor_id] = {
+        period = 1.0 / self.ctrl_frequency
+        backoff_base = max(0.5, period * 10.0)
+        backoff_cap = 5.0
+
+        for motor_id in motor_ids:
+            now = time.monotonic()
+            next_allowed = self._poll_next_allowed_at.get(motor_id, 0.0)
+            if now < next_allowed:
+                continue
+
+            status = self.motor.get_motor_status(motor_id, sync=True, timeout=period)
+            feedback_update = {
                 "position_deg": status.get("angle"),
                 "online": status.get("online"),
                 "fsm_state": status.get("fsm_state"),
@@ -704,6 +734,22 @@ class ParaHand:
                 "temp": status.get("temp"),
                 "bus_voltage": status.get("bus_voltage"),
             }
+            # A timeout may return the last cached angle. Never replace a valid
+            # position with a synthetic zero merely because one poll was lost.
+            if status.get("timeout") and not status.get("cached", False):
+                feedback_update.pop("position_deg", None)
+            updated_feedback[motor_id] = feedback_update
+
+            if status.get("timeout"):
+                failure_count = self._poll_failure_counts.get(motor_id, 0) + 1
+                self._poll_failure_counts[motor_id] = failure_count
+                cooldown = min(backoff_base * (2 ** (failure_count - 1)), backoff_cap)
+                self._poll_next_allowed_at[motor_id] = time.monotonic() + cooldown
+                self._poll_bus_pause_until = time.monotonic() + min(max(cooldown * 0.5, 0.1), 0.5)
+                break
+            else:
+                self._poll_failure_counts.pop(motor_id, None)
+                self._poll_next_allowed_at.pop(motor_id, None)
 
         with self._feedback_lock:
             for motor_id, values in updated_feedback.items():
@@ -738,7 +784,9 @@ class ParaHand:
             except Exception:
                 pass
             elapsed = time.time() - started_at
-            self._poll_stop_event.wait(max(0.0, period - elapsed))
+            pause_until = self._poll_bus_pause_until
+            extra_wait = max(0.0, pause_until - time.monotonic()) if pause_until > 0.0 else 0.0
+            self._poll_stop_event.wait(max(0.0, period - elapsed, extra_wait))
 
     def _register_callbacks(self):
         '''注册角度、速度和电流广播回调。'''

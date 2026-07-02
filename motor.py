@@ -106,7 +106,16 @@ class Motor:
         self.write_timeout_s = float(write_timeout_s)
         self.serial = None
         self.connected = False
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        # A status request must own the bus until its response arrives. Without
+        # this transaction lock, queued angle broadcasts can be transmitted
+        # between the request and response and make the synchronous poller
+        # consume the wrong frame or time out.
+        self._status_transaction_lock = threading.RLock()
+        self._latest_angle_broadcast_lock = threading.Lock()
+        self._pending_angle_broadcast: Optional[Command] = None
+        self._last_motor_status: Dict[int, Dict[str, Any]] = {}
+        self._last_status_warning_at: Dict[int, float] = {}
         
         # 队列和线程
         self.command_queue = queue.Queue()
@@ -236,24 +245,38 @@ class Motor:
     def _send_worker(self):
         """发送工作线程"""
         while self.running:
+            command = None
             try:
                 # 从队列获取命令
                 command = self.command_queue.get(timeout=0.1)
                 
                 if command is None:  # 停止信号
+                    self.command_queue.task_done()
                     break
+
+                command = self._resolve_latest_angle_broadcast(command)
                 
                 # 执行命令
-                self._execute_command(command)
-                
-                # 标记任务完成
-                self.command_queue.task_done()
+                with self._status_transaction_lock:
+                    self._execute_command(command)
                 
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"Send error: {e}")
                 time.sleep(0.01)
+            finally:
+                if command is not None:
+                    self.command_queue.task_done()
+
+    def _resolve_latest_angle_broadcast(self, command: Command) -> Command:
+        """Resolve a queued angle token to the newest pending command."""
+        if command.type != CommandType.SET_MOTOR_ANGLES_BROADCAST:
+            return command
+        with self._latest_angle_broadcast_lock:
+            latest = self._pending_angle_broadcast
+            self._pending_angle_broadcast = None
+        return latest if latest is not None else command
     
     def _receive_worker(self):
         """接收工作线程"""
@@ -371,18 +394,29 @@ class Motor:
             raise RuntimeError("未连接到电机控制系统")
             
         with self.lock:
-            try:
-                # 清空发送缓冲区
-                self.serial.reset_output_buffer()
-
-                current_time = datetime.datetime.now()
-                # print(f"[{current_time.strftime('%H:%M:%S.%f')[:-3]}] Sending data: {' '.join(f'{b:02X}' for b in frame)}")
-                # 发送数据
-                self.serial.write(frame)
-                self.serial.flush()
-                time.sleep(0.003)
-            except Exception as e:
-                raise RuntimeError(f"发送数据失败: {e}")
+            last_error = None
+            for attempt in range(2):
+                try:
+                    written = self.serial.write(frame)
+                    if written is not None and int(written) != len(frame):
+                        raise serial.SerialTimeoutException(
+                            f"partial write: {written}/{len(frame)} bytes"
+                        )
+                    self.serial.flush()
+                    time.sleep(0.003)
+                    return
+                except serial.SerialTimeoutException as exc:
+                    last_error = exc
+                    if attempt == 0:
+                        try:
+                            self.serial.reset_output_buffer()
+                        except Exception:
+                            pass
+                        time.sleep(0.005)
+                        continue
+                except Exception as exc:
+                    raise RuntimeError(f"发送数据失败: {exc}") from exc
+            raise RuntimeError(f"发送数据失败，重试后仍超时: {last_error}") from last_error
     
     def _calculate_crc16_ccitt_false(self, data: bytes) -> int:
         """
@@ -1183,15 +1217,14 @@ class Motor:
                 # 短暂等待后再次检查
                 time.sleep(0.01)  # 10ms
             
-            # 如果没有找到，返回默认值
-            # print(f"等待{wait_time*1000:.0f}ms后未收到电机{motor_id}响应，返回默认状态")
             return {
                 'online': False,
                 'angle': 0.0,
                 'fsm_state': 0,
                 'error_code': 0,
                 'temp': 25.0,
-                'bus_voltage': 24.0
+                'bus_voltage': 24.0,
+                'timeout': True,
             }
             
         except Exception as e:
@@ -1524,52 +1557,63 @@ class Motor:
     def _get_motor_status_sync(self, motor_id: int, timeout: float = 1.0) -> Dict:
         """同步获取电机状态"""
         try:
-            # 清空响应队列中的旧数据
-            self.clear_response_queue()
-            
-            # 发送命令
-            command_id = f"get_motor_status_sync_{self.command_counter}"
-            self.command_counter += 1
-            
-            command = Command(
-                id=command_id,
-                type=CommandType.GET_MOTOR_STATUS,
-                data={'motor_id': motor_id},
-                timestamp=time.time()
-            )
-            
-            self.command_queue.put(command)
-            
-            # 等待响应
-            start_time = time.time()
-            while time.time() - start_time < timeout:
-                response = self.get_response(timeout=0.1)
-                if response and response.type == ResponseType.STATUS_RESPONSE:
-                    if response.data.get('motor_id') == motor_id:
-                        return response.data
-                time.sleep(0.01)
-            
-            # 超时返回默认值
-            print(f"Getting motor {motor_id} status timeout")
-            return {
-                'online': False,
-                'angle': 0.0,
-                'fsm_state': 0,
-                'error_code': 0,
-                'temp': 25.0,
-                'bus_voltage': 24.0
-            }
-            
+            with self._status_transaction_lock:
+                self._drain_status_response_queue(motor_id)
+                can_data1 = bytes([motor_id, 0x01]) + b'\x00' * 6
+                frame1 = self._build_frame(self.STATUS_PULL_ID, can_data1)
+                self._send_raw(frame1)
+
+                response_timeout = max(0.05, float(timeout))
+                deadline = time.monotonic() + response_timeout
+                while time.monotonic() < deadline:
+                    status = self._drain_status_response_queue(motor_id)
+                    if status is not None:
+                        status = dict(status)
+                        status["timeout"] = False
+                        self._last_motor_status[motor_id] = status.copy()
+                        return status
+                    time.sleep(min(0.002, max(0.0, deadline - time.monotonic())))
+
+            self._warn_status_timeout(motor_id, f"Getting motor {motor_id} status timeout")
+            return self._cached_timeout_status(motor_id)
+
         except Exception as e:
-            print(f"Synchronously getting motor {motor_id} status failed: {e}")
-            return {
+            self._warn_status_timeout(
+                motor_id,
+                f"Synchronously getting motor {motor_id} status failed: {e}",
+            )
+            return self._cached_timeout_status(motor_id)
+
+    def _cached_timeout_status(self, motor_id: int) -> Dict[str, Any]:
+        has_cached_status = motor_id in self._last_motor_status
+        status = dict(
+            self._last_motor_status.get(
+                motor_id,
+                {
+                    'angle': 0.0,
+                    'fsm_state': 0,
+                    'error_code': 0,
+                    'temp': 25.0,
+                    'bus_voltage': 24.0,
+                },
+            )
+        )
+        status.update(
+            {
+                'motor_id': motor_id,
                 'online': False,
-                'angle': 0.0,
-                'fsm_state': 0,
-                'error_code': 0,
-                'temp': 25.0,
-                'bus_voltage': 24.0
+                'timeout': True,
+                'cached': has_cached_status,
             }
+        )
+        return status
+
+    def _warn_status_timeout(self, motor_id: int, message: str) -> None:
+        now = time.monotonic()
+        last_warning = self._last_status_warning_at.get(motor_id, float("-inf"))
+        if now - last_warning >= 2.0:
+            print(message)
+            self._last_status_warning_at[motor_id] = now
 
     def add_response_callback(self, response_type: ResponseType, callback: callable):
         """
@@ -1620,6 +1664,31 @@ class Motor:
             except queue.Empty:
                 break
 
+    def _drain_status_response_queue(self, motor_id: int) -> Optional[Dict[str, Any]]:
+        """从响应队列中提取指定电机的最新状态响应，并保留其他响应。"""
+        latest_status = None
+        preserved_responses = []
+
+        while True:
+            try:
+                response = self.response_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if (
+                hasattr(response, "type")
+                and response.type == ResponseType.STATUS_RESPONSE
+                and getattr(response, "data", {}).get("motor_id") == motor_id
+            ):
+                latest_status = response.data
+            else:
+                preserved_responses.append(response)
+
+        for response in preserved_responses:
+            self.response_queue.put(response)
+
+        return latest_status
+
     def get_queue_status(self) -> Dict[str, int]:
         """
         获取队列状态
@@ -1657,8 +1726,15 @@ class Motor:
             timestamp=time.time(),
             callback=callback
         )
-        
-        self.command_queue.put(command)
+
+        # Angle targets are state, not events: if the serial worker is busy,
+        # only the newest target is useful. Keep one queue token and replace
+        # its payload instead of building an unbounded stale-command backlog.
+        with self._latest_angle_broadcast_lock:
+            should_enqueue = self._pending_angle_broadcast is None
+            self._pending_angle_broadcast = command
+            if should_enqueue:
+                self.command_queue.put(command)
         return command_id
 
     def set_motor_speeds_broadcast(self, speeds: Dict[int, float], callback: Optional[callable] = None) -> str:

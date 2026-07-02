@@ -101,6 +101,8 @@ pip install pyserial
 - `set_joint_positions()` / `get_joint_feedback()`：关节/电机角度语义，输入和反馈单位为度，适合调试单个电机或做底层校准。
 - `set_hand_position_map()` / `get_hand_position_map()`：整手姿态语义，普通关节单位为弧度，`pip_dip` 表示 tendon length，单位为米。
 
+> 部署策略注意：MuJoCo `ParaHandGraspArm` deploy 只应调用 `get_hand_positions()`、`set_hand_positions_broadcast()` 或 `set_hand_positions()` 这类 hand-position 接口。`pip_dip` 值按 tendon length 直接传入，不要使用 teleop 中的 `0.025 - tendon_m` 反向变换。
+
 hand-position 语义覆盖 16 个关节：
 
 | 手指 | hand-position 字段 | 单位 |
