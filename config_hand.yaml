@@ -9,6 +9,7 @@ tactile:
   port: /dev/ttyUSB1
   baudrate: 115200
   timeout_s: 1.0
+  contact_threshold_g: 10.0
   channel_fingers:
   - thumb
   - index

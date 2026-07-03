@@ -49,6 +49,7 @@ class TactileDefinition:
     baudrate: int
     timeout_s: float
     channel_fingers: tuple[str, ...]
+    contact_threshold_g: float
 
 
 class ParaHand:
@@ -643,6 +644,7 @@ class ParaHand:
         baudrate: Any,
         timeout_s: Any,
         channel_fingers: Optional[Any] = None,
+        contact_threshold_g: Optional[float] = None,
     ):
         '''更新触觉传感器连接参数。'''
         new_config = copy.deepcopy(self.config)
@@ -658,6 +660,8 @@ class ParaHand:
         tactile_config["timeout_s"] = self._parse_timeout(timeout_s, "tactile.timeout_s")
         if channel_fingers is not None:
             tactile_config["channel_fingers"] = list(self._parse_tactile_channel_fingers(channel_fingers))
+        if contact_threshold_g is not None:
+            tactile_config["contact_threshold_g"] = float(contact_threshold_g)
 
         self._rebuild_from_config(new_config)
 
@@ -1130,6 +1134,7 @@ class ParaHand:
         port = self._parse_tactile_port(tactile_config.get("port", None))
         baudrate = self._parse_baudrate(tactile_config.get("baudrate", 115200))
         timeout_s = self._parse_timeout(tactile_config.get("timeout_s", 1.0), "tactile.timeout_s")
+        contact_threshold_g = float(tactile_config.get("contact_threshold_g", 10.0))
         channel_fingers = self._parse_tactile_channel_fingers(
             tactile_config.get("channel_fingers", FINGERTIP_FORCE_ORDER)
         )
@@ -1139,6 +1144,7 @@ class ParaHand:
             baudrate=baudrate,
             timeout_s=timeout_s,
             channel_fingers=channel_fingers,
+            contact_threshold_g=contact_threshold_g,
         )
 
     def _parse_tactile_port(self, port: Any) -> Optional[str]:

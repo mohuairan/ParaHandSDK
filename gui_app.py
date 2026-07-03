@@ -652,7 +652,11 @@ class MainWindow(QMainWindow):
         "ring": "无名指",
         "little": "小指",
     }
-    TACTILE_CONTACT_THRESHOLD_G = 50.0
+
+    @property
+    def contact_threshold_g(self) -> float:
+        """指尖接触力阈值（从 config 读取，实时反映 UI 修改）。"""
+        return float(self.hand.tactile_config.contact_threshold_g)
 
     def __init__(self, config_path: Optional[str] = None):
         super().__init__()
@@ -709,6 +713,7 @@ class MainWindow(QMainWindow):
         self.tactile_force_box = QGroupBox("Fingertip Contact Force")
         self.tactile_force_labels: Dict[str, QLabel] = {}
         self.tactile_force_status_label = QLabel("--")
+        self.tactile_threshold_spinbox = QDoubleSpinBox()
 
         self.empty_label = QLabel("config_hand.yaml 中还没有有效的 joint 配置，请先填写 id / range / reverse。")
         self.scroll_area = QScrollArea()
@@ -797,6 +802,13 @@ class MainWindow(QMainWindow):
         self.tactile_timeout_spinbox.setSuffix(" s")
         self.tactile_timeout_spinbox.setFixedWidth(100)
 
+        self.tactile_threshold_spinbox.setDecimals(1)
+        self.tactile_threshold_spinbox.setRange(0.1, 9999.0)
+        self.tactile_threshold_spinbox.setSingleStep(5.0)
+        self.tactile_threshold_spinbox.setKeyboardTracking(False)
+        self.tactile_threshold_spinbox.setSuffix(" g")
+        self.tactile_threshold_spinbox.setToolTip("指尖接触力阈值，超过此值视为按压")
+
         self.connection_config_toggle_button.setText("控制器配置")
         self.connection_config_toggle_button.setCheckable(True)
         self.connection_config_toggle_button.setArrowType(Qt.RightArrow)
@@ -833,6 +845,8 @@ class MainWindow(QMainWindow):
         connection_grid.addWidget(self.tactile_baudrate_spinbox, 4, 1)
         connection_grid.addWidget(QLabel("tactile timeout_s"), 4, 2)
         connection_grid.addWidget(self.tactile_timeout_spinbox, 4, 3)
+        connection_grid.addWidget(QLabel("tactile threshold"), 5, 0)
+        connection_grid.addWidget(self.tactile_threshold_spinbox, 5, 1)
 
         footer_layout = QHBoxLayout()
         footer_layout.setContentsMargins(12, 0, 0, 0)
@@ -930,6 +944,7 @@ class MainWindow(QMainWindow):
         self.tactile_port_input.textChanged.connect(self._mark_connection_config_dirty)
         self.tactile_baudrate_spinbox.valueChanged.connect(self._mark_connection_config_dirty)
         self.tactile_timeout_spinbox.valueChanged.connect(self._mark_connection_config_dirty)
+        self.tactile_threshold_spinbox.valueChanged.connect(self._on_threshold_changed)
         self.save_connection_config_button.clicked.connect(self._save_connection_config)
         self.gui_step_spinbox.valueChanged.connect(self._apply_gui_step_to_rows)
 
@@ -952,6 +967,7 @@ class MainWindow(QMainWindow):
         self.tactile_port_input.setText(self.hand.tactile_config.port or "auto")
         self.tactile_baudrate_spinbox.setValue(int(self.hand.tactile_config.baudrate))
         self.tactile_timeout_spinbox.setValue(float(self.hand.tactile_config.timeout_s))
+        self.tactile_threshold_spinbox.setValue(float(self.hand.tactile_config.contact_threshold_g))
         self._syncing_connection_config = False
         self._connection_config_dirty = False
         self.connection_config_status_label.setText(status_text)
@@ -972,6 +988,7 @@ class MainWindow(QMainWindow):
         self.tactile_port_input.setEnabled(enabled)
         self.tactile_baudrate_spinbox.setEnabled(enabled)
         self.tactile_timeout_spinbox.setEnabled(enabled)
+        self.tactile_threshold_spinbox.setEnabled(enabled)
         self.save_connection_config_button.setEnabled(enabled)
 
     def _save_connection_config(self):
@@ -992,6 +1009,7 @@ class MainWindow(QMainWindow):
                 self.tactile_port_input.text(),
                 self.tactile_baudrate_spinbox.value(),
                 self.tactile_timeout_spinbox.value(),
+                contact_threshold_g=self.tactile_threshold_spinbox.value(),
             )
             self.hand.save_config()
             self._load_connection_config_fields("已保存")
@@ -1282,7 +1300,7 @@ class MainWindow(QMainWindow):
             if force_g < 0:
                 label.setText("ERR")
                 label.setStyleSheet("color: #777;")
-            elif force_g > self.TACTILE_CONTACT_THRESHOLD_G:
+            elif force_g > self.contact_threshold_g:
                 label.setText(f"{force_g:.1f} g")
                 label.setStyleSheet("color: #0a7f35; font-weight: 600;")
             else:
@@ -1306,12 +1324,27 @@ class MainWindow(QMainWindow):
             return
 
         valid_count = sum(1 for force_g in forces if force_g >= 0)
-        contact_count = sum(1 for force_g in forces if force_g > self.TACTILE_CONTACT_THRESHOLD_G)
+        contact_count = sum(1 for force_g in forces if force_g > self.contact_threshold_g)
         if valid_count == 0:
             status_text = "等待触觉数据"
         else:
             status_text = f"触觉读取中 | 接触 {contact_count}/5 | 有效 {valid_count}/5"
         self._set_tactile_force_values(forces, status_text)
+
+    def _on_threshold_changed(self, value: float):
+        """当用户在 UI 中修改按压阈值时，同步更新 config 中的值。"""
+        try:
+            self.hand.update_tactile_config(
+                self.tactile_enabled_checkbox.isChecked(),
+                self.tactile_port_input.text(),
+                self.tactile_baudrate_spinbox.value(),
+                self.tactile_timeout_spinbox.value(),
+                contact_threshold_g=value,
+            )
+            self.hand.save_config()
+            self.connection_config_status_label.setText("已保存")
+        except Exception as exc:
+            self.connection_config_status_label.setText(f"保存阈值失败: {exc}")
 
     def _connect_device(self):
         if self._connection_config_dirty:
