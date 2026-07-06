@@ -652,7 +652,7 @@ class MainWindow(QMainWindow):
         "ring": "无名指",
         "little": "小指",
     }
-    TACTILE_CONTACT_THRESHOLD_G = 50.0
+    TACTILE_CONTACT_THRESHOLD_G = 5.0
 
     def __init__(self, config_path: Optional[str] = None):
         super().__init__()

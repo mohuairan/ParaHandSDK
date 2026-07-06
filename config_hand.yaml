@@ -1,12 +1,12 @@
 ctrl_frequency: 50.0
 serial:
-  port: /dev/ttyUSB0
+  port: /dev/ttyUSB1
   baudrate: 230400
   timeout_s: 0.05
   write_timeout_s: 0.05
 tactile:
   enabled: true
-  port: /dev/ttyUSB1
+  port: /dev/ttyUSB0
   baudrate: 115200
   timeout_s: 1.0
   channel_fingers:
