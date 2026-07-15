@@ -15,7 +15,8 @@ if os.name == "nt":
             pass
 
 try:
-    from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
+    from PySide6.QtCore import QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
+    from PySide6.QtGui import QColor, QPainter, QPen
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -117,6 +118,208 @@ class FlowLayout(QLayout):
         return y + line_height - rect.y() + margins.bottom()
 
 
+class PressureMatrixWidget(QWidget):
+    """按统一显示阈值将一个触觉区域的压力矩阵绘制为热力图。"""
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._matrices: tuple[tuple[tuple[float, ...], ...], ...] = ()
+        self._display_threshold = 1.0
+        self._unit = ""
+        self.setMinimumSize(72, 82)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def sizeHint(self) -> QSize:
+        return QSize(112, 104)
+
+    @staticmethod
+    def _heat_color(value: float, minimum: float, maximum: float) -> QColor:
+        ratio = 0.0 if maximum <= minimum else (value - minimum) / (maximum - minimum)
+        ratio = max(0.0, min(1.0, ratio))
+        if ratio < 1 / 3:
+            local = ratio * 3
+            red, green, blue = 20, int(70 + 170 * local), int(210 + 35 * local)
+        elif ratio < 2 / 3:
+            local = (ratio - 1 / 3) * 3
+            red, green, blue = int(20 + 235 * local), 240, int(245 - 210 * local)
+        else:
+            local = (ratio - 2 / 3) * 3
+            red = 255
+            green = int(240 * (1 - local))
+            blue = int(35 * (1 - local))
+        return QColor(red, green, blue)
+
+    @staticmethod
+    def _text_color(value: float, minimum: float, maximum: float) -> QColor:
+        ratio = 0.0 if maximum <= minimum else (value - minimum) / (maximum - minimum)
+        return QColor("#111111" if 0.25 <= ratio <= 0.78 else "#ffffff")
+
+    def set_matrices(self, matrices: Any, unit: str = ""):
+        normalized: list[tuple[tuple[float, ...], ...]] = []
+        if matrices is not None:
+            for matrix in matrices:
+                rows: list[tuple[float, ...]] = []
+                for row in matrix:
+                    try:
+                        values = tuple(float(value) for value in row)
+                    except (TypeError, ValueError):
+                        continue
+                    if values:
+                        rows.append(values)
+                if rows:
+                    normalized.append(tuple(rows))
+
+        self._matrices = tuple(normalized)
+        self._unit = str(unit)
+        self._update_tooltip()
+        self.update()
+
+    def set_display_threshold(self, threshold: float):
+        self._display_threshold = max(float(threshold), 0.001)
+        self.update()
+
+    def values(self) -> list[float]:
+        return [
+            value
+            for matrix in self._matrices
+            for row in matrix
+            for value in row
+        ]
+
+    def summary_text(self) -> str:
+        values = self.values()
+        if not values:
+            return "--"
+        primary = self._matrices[0]
+        rows = len(primary)
+        columns = max((len(row) for row in primary), default=0)
+        valid_values = [value for value in values if value >= 0]
+        if not valid_values:
+            return f"{rows}×{columns}  ERR"
+        decimals = 1 if self._unit == "g" else 0
+        block_text = f"/{len(self._matrices)} blocks" if len(self._matrices) > 1 else ""
+        return (
+            f"{rows}×{columns}{block_text}  max {max(valid_values):.{decimals}f}\n"
+            f"avg {sum(valid_values) / len(valid_values):.{decimals}f} {self._unit}".rstrip()
+        )
+
+    def _update_tooltip(self):
+        values = [value for value in self.values() if value >= 0]
+        if not values:
+            self.setToolTip("暂无压力矩阵数据")
+            return
+        self.setToolTip(
+            f"最小 {min(values):g} {self._unit} | 最大 {max(values):g} {self._unit} | "
+            f"平均 {sum(values) / len(values):.2f} {self._unit}"
+        )
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), self.palette().base())
+        if not self._matrices:
+            painter.setPen(self.palette().mid().color())
+            painter.drawText(self.rect(), Qt.AlignCenter, "--")
+            return
+
+        outer_margin = 2.0
+        block_gap = 4.0
+        available_width = max(
+            1.0,
+            self.width() - outer_margin * 2 - block_gap * (len(self._matrices) - 1),
+        )
+        block_width = available_width / len(self._matrices)
+        block_height = max(1.0, self.height() - outer_margin * 2)
+        outline_pen = QPen(QColor("#777777"))
+        outline_pen.setWidthF(0.5)
+
+        for block_index, matrix in enumerate(self._matrices):
+            row_count = len(matrix)
+            column_count = max((len(row) for row in matrix), default=0)
+            if row_count == 0 or column_count == 0:
+                continue
+            start_x = outer_margin + block_index * (block_width + block_gap)
+            cell_width = block_width / column_count
+            cell_height = block_height / row_count
+            show_values = min(cell_width, cell_height) >= 28
+
+            for row_index, row in enumerate(matrix):
+                for column_index, value in enumerate(row):
+                    cell_rect = QRectF(
+                        start_x + column_index * cell_width,
+                        outer_margin + row_index * cell_height,
+                        cell_width,
+                        cell_height,
+                    )
+                    painter.setPen(outline_pen)
+                    if value < 0:
+                        painter.setBrush(QColor("#777777"))
+                    else:
+                        painter.setBrush(self._heat_color(value, 0.0, self._display_threshold))
+                    painter.drawRect(cell_rect)
+                    if show_values:
+                        if value < 0:
+                            painter.setPen(QColor("#ffffff"))
+                            cell_text = "ERR"
+                        else:
+                            painter.setPen(self._text_color(value, 0.0, self._display_threshold))
+                            cell_text = f"{value:g}"
+                        painter.drawText(cell_rect, Qt.AlignCenter, cell_text)
+
+
+class PressureColorLegend(QWidget):
+    """显示压力值到热力颜色的对应关系。"""
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._threshold = 1.0
+        self._unit = ""
+        self.setMinimumSize(180, 38)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def sizeHint(self) -> QSize:
+        return QSize(230, 38)
+
+    def set_threshold(self, threshold: float, unit: str):
+        self._threshold = max(float(threshold), 0.001)
+        self._unit = str(unit)
+        self.setToolTip(f"蓝色 0 {self._unit}，红色 ≥ {self._threshold:g} {self._unit}")
+        self.update()
+
+    def _format_tick(self, value: float) -> str:
+        if self._unit == "g":
+            return f"{value:.1f}"
+        return f"{value:.0f}"
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        bar_rect = QRectF(2.0, 2.0, max(1.0, self.width() - 4.0), 15.0)
+        steps = max(2, int(bar_rect.width()))
+        step_width = bar_rect.width() / steps
+        for index in range(steps):
+            ratio = index / (steps - 1)
+            painter.fillRect(
+                QRectF(bar_rect.left() + index * step_width, bar_rect.top(), step_width + 1, bar_rect.height()),
+                PressureMatrixWidget._heat_color(ratio, 0.0, 1.0),
+            )
+        painter.setPen(QPen(QColor("#777777")))
+        painter.drawRect(bar_rect)
+
+        for index, ratio in enumerate((0.0, 1 / 3, 2 / 3, 1.0)):
+            x = bar_rect.left() + ratio * bar_rect.width()
+            painter.drawLine(QPoint(int(x), int(bar_rect.bottom())), QPoint(int(x), int(bar_rect.bottom() + 3)))
+            label = self._format_tick(self._threshold * ratio)
+            if index == 0:
+                label_rect = QRectF(x, bar_rect.bottom() + 4, 54, 17)
+                alignment = Qt.AlignLeft | Qt.AlignTop
+            elif index == 3:
+                label_rect = QRectF(x - 54, bar_rect.bottom() + 4, 54, 17)
+                alignment = Qt.AlignRight | Qt.AlignTop
+            else:
+                label_rect = QRectF(x - 30, bar_rect.bottom() + 4, 60, 17)
+                alignment = Qt.AlignHCenter | Qt.AlignTop
+            painter.drawText(label_rect, alignment, label)
+
+
 class JointRowWidget(QGroupBox):
     targetChanged = Signal(str, float)
     stepAdjustStarted = Signal(str, int)
@@ -137,7 +340,7 @@ class JointRowWidget(QGroupBox):
         parent: Optional[QWidget] = None,
         display_name: Optional[str] = None,
     ):
-        super().__init__(display_name or joint_name, parent)
+        super().__init__("", parent)
         self.joint_name = joint_name
         self.definition = definition
         self._is_pip_dip = joint_name.endswith(".pip_dip")
@@ -165,13 +368,13 @@ class JointRowWidget(QGroupBox):
         self.actual_label = QLabel("[--]")
         self.motor_target_label = QLabel("")
         self.motor_actual_angle_label = QLabel("")
+        self.online_indicator = QLabel()
         self.active_checkbox = QCheckBox()
+        self.joint_name_label = QLabel(display_name or joint_name)
 
         self.details_toggle_button = QToolButton()
         self.details_container = QWidget()
         self.status_grid_widget = QWidget()
-        self.online_key_label = QLabel("online")
-        self.online_value_label = QLabel("--")
         self.state_key_label = QLabel("state")
         self.state_value_label = QLabel("--")
         self.bus_key_label = QLabel("bus")
@@ -213,6 +416,14 @@ class JointRowWidget(QGroupBox):
         self.plus_button.setFixedWidth(32)
         self.zero_minus_button.setFixedWidth(32)
         self.zero_plus_button.setFixedWidth(32)
+
+        self.online_indicator.setFixedSize(12, 12)
+        self._set_online_state(False)
+
+        self.joint_name_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        self.joint_name_label.setAlignment(Qt.AlignCenter)
+        self.joint_name_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.joint_name_label.setToolTip(self.joint_name)
 
         self.slider.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
@@ -261,8 +472,16 @@ class JointRowWidget(QGroupBox):
         controls_layout = QHBoxLayout()
         controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.setSpacing(6)
-        controls_layout.addWidget(self.active_checkbox)
-        controls_layout.addWidget(self.minus_button)
+
+        compact_controls_layout = QHBoxLayout()
+        compact_controls_layout.setContentsMargins(0, 0, 0, 0)
+        compact_controls_layout.setSpacing(2)
+        compact_controls_layout.addWidget(self.online_indicator)
+        compact_controls_layout.addWidget(self.active_checkbox)
+        compact_controls_layout.addWidget(self.joint_name_label)
+        compact_controls_layout.addWidget(self.minus_button)
+
+        controls_layout.addLayout(compact_controls_layout)
         controls_layout.addWidget(self.slider, 1)
         controls_layout.addWidget(self.spinbox)
         controls_layout.addWidget(self.plus_button)
@@ -273,20 +492,18 @@ class JointRowWidget(QGroupBox):
         status_grid.setContentsMargins(0, 0, 0, 0)
         status_grid.setHorizontalSpacing(10)
         status_grid.setVerticalSpacing(4)
-        status_grid.addWidget(self.online_key_label, 0, 0)
-        status_grid.addWidget(self.online_value_label, 0, 1)
-        status_grid.addWidget(self.state_key_label, 1, 0)
-        status_grid.addWidget(self.state_value_label, 1, 1)
-        status_grid.addWidget(self.bus_key_label, 1, 2)
-        status_grid.addWidget(self.bus_value_label, 1, 3)
-        status_grid.addWidget(self.error_key_label, 2, 0)
-        status_grid.addWidget(self.error_value_label, 2, 1)
-        status_grid.addWidget(self.speed_key_label, 2, 2)
-        status_grid.addWidget(self.speed_value_label, 2, 3)
-        status_grid.addWidget(self.temp_key_label, 3, 0)
-        status_grid.addWidget(self.temp_value_label, 3, 1)
-        status_grid.addWidget(self.current_key_label, 3, 2)
-        status_grid.addWidget(self.current_value_label, 3, 3)
+        status_grid.addWidget(self.state_key_label, 0, 0)
+        status_grid.addWidget(self.state_value_label, 0, 1)
+        status_grid.addWidget(self.bus_key_label, 0, 2)
+        status_grid.addWidget(self.bus_value_label, 0, 3)
+        status_grid.addWidget(self.error_key_label, 1, 0)
+        status_grid.addWidget(self.error_value_label, 1, 1)
+        status_grid.addWidget(self.speed_key_label, 1, 2)
+        status_grid.addWidget(self.speed_value_label, 1, 3)
+        status_grid.addWidget(self.temp_key_label, 2, 0)
+        status_grid.addWidget(self.temp_value_label, 2, 1)
+        status_grid.addWidget(self.current_key_label, 2, 2)
+        status_grid.addWidget(self.current_value_label, 2, 3)
         self.status_grid_widget.setLayout(status_grid)
 
         extra_layout = QVBoxLayout()
@@ -561,6 +778,8 @@ class JointRowWidget(QGroupBox):
 
     def set_motion_enabled(self, enabled: bool):
         self._connected = enabled
+        if not enabled:
+            self._set_online_state(False)
         self._apply_motion_state()
 
     def set_config_editable(self, enabled: bool):
@@ -601,7 +820,7 @@ class JointRowWidget(QGroupBox):
             self.actual_label.setText("[未启用]")
             self.motor_target_label.setText("")
             self.motor_actual_angle_label.setText("")
-            self.online_value_label.setText("未启用")
+            self._set_online_state(False)
             self.state_value_label.setText("--")
             self.bus_value_label.setText("--")
             self.error_value_label.setText("--")
@@ -611,7 +830,7 @@ class JointRowWidget(QGroupBox):
             return
 
         self.set_actual_display_value(actual_display_value, actual_unit_suffix)
-        self.online_value_label.setText(self._format_bool(feedback.get('online')))
+        self._set_online_state(bool(feedback.get('online')))
         self.state_value_label.setText(self._format_value(feedback.get('fsm_state')))
         self.bus_value_label.setText(self._format_number(feedback.get('bus_voltage'), 'V'))
         self.error_value_label.setText(self._format_value(feedback.get('error_code')))
@@ -624,10 +843,19 @@ class JointRowWidget(QGroupBox):
             return "--"
         return f"{float(value):.2f}{suffix}"
 
-    def _format_bool(self, value: Any) -> str:
-        if value is None:
-            return "--"
-        return "在线" if bool(value) else "离线"
+    def _set_online_state(self, online: bool):
+        if online:
+            background = "#27ae60"
+            border = "#176b3a"
+            tooltip = "在线"
+        else:
+            background = "#d9534f"
+            border = "#8f2926"
+            tooltip = "离线"
+        self.online_indicator.setStyleSheet(
+            f"background-color: {background}; border: 1px solid {border}; border-radius: 6px;"
+        )
+        self.online_indicator.setToolTip(tooltip)
 
     def _format_number(self, value: Any, suffix: str) -> str:
         if value is None:
@@ -655,7 +883,7 @@ class MainWindow(QMainWindow):
 
     @property
     def contact_threshold_g(self) -> float:
-        """指尖接触力阈值（从 config 读取，实时反映 UI 修改）。"""
+        """当前模式的指尖接触阈值，单位为 g。"""
         return float(self.hand.tactile_config.contact_threshold_g)
 
     def __init__(self, config_path: Optional[str] = None):
@@ -689,7 +917,7 @@ class MainWindow(QMainWindow):
         self.control_mode_combo.addItem("电机模式", self.MOTOR_MODE)
         self.control_mode_combo.addItem("ParaHand模式", self.PARAHAND_MODE)
         self.status_label = QLabel("未连接")
-        self.config_label = QLabel(f"配置: {self.hand.config_path}")
+        self.config_label = QLabel(f"配置文件: {self.hand.config_path}")
         self.config_help_label = QLabel(
             "顶部可切换电机模式与 ParaHand 模式；ParaHand 模式下普通关节显示角度，pip_dip 显示毫米并走 hand-position 接口。"
         )
@@ -705,15 +933,26 @@ class MainWindow(QMainWindow):
         self.write_timeout_spinbox = QDoubleSpinBox()
         self.gui_step_spinbox = QDoubleSpinBox()
         self.tactile_enabled_checkbox = QCheckBox("启用触觉")
+        self.tactile_mode_combo = QComboBox()
+        self.tactile_mode_combo.addItem("FSR402", "fsr402")
+        self.tactile_mode_combo.addItem("华威科", "hwk")
         self.tactile_port_input = QLineEdit()
         self.tactile_baudrate_spinbox = QSpinBox()
         self.tactile_timeout_spinbox = QDoubleSpinBox()
         self.save_connection_config_button = QPushButton("保存控制器配置")
         self.connection_config_status_label = QLabel("已载入")
-        self.tactile_force_box = QGroupBox("Fingertip Contact Force")
-        self.tactile_force_labels: Dict[str, QLabel] = {}
+        self.tactile_force_box = QGroupBox("Fingertip Pressure Matrix & Force Summary (g)")
+        self.tactile_matrix_widgets: Dict[str, PressureMatrixWidget] = {}
+        self.tactile_matrix_summary_labels: Dict[str, QLabel] = {}
+        self.tactile_force_summary_labels: Dict[str, QLabel] = {}
         self.tactile_force_status_label = QLabel("--")
+        self._tactile_display_thresholds = {"fsr402": 100.0, "hwk": 256.0}
+        self._tactile_display_slider_scale = 1.0
+        self.tactile_display_threshold_slider = QSlider(Qt.Horizontal)
+        self.tactile_display_threshold_value_label = QLabel("--")
+        self.tactile_color_legend = PressureColorLegend()
         self.tactile_threshold_spinbox = QDoubleSpinBox()
+        self.tactile_threshold_label = QLabel("tactile threshold")
 
         self.empty_label = QLabel("config_hand.yaml 中还没有有效的 joint 配置，请先填写 id / range / reverse。")
         self.scroll_area = QScrollArea()
@@ -731,6 +970,7 @@ class MainWindow(QMainWindow):
         self._set_status(f"就绪 | 配置: {self.hand.config_path}")
         self._refresh_tactile_feedback()
         self._resize_to_minimum_start_width()
+        self._set_status(self._format_connection_status(False, False))
 
     def _build_ui(self):
         self.setWindowTitle("ParaHand Center")
@@ -753,7 +993,8 @@ class MainWindow(QMainWindow):
 
         self.config_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.config_label.setWordWrap(True)
-        self.status_label.setWordWrap(True)
+        self.status_label.setWordWrap(False)
+        self.status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.config_help_label.setWordWrap(True)
         self.step_hint_label.setWordWrap(True)
         self.empty_label.setWordWrap(True)
@@ -790,6 +1031,7 @@ class MainWindow(QMainWindow):
 
         self.tactile_port_input.setClearButtonEnabled(True)
         self.tactile_port_input.setMinimumWidth(100)
+        self.tactile_mode_combo.setFixedWidth(110)
 
         self.tactile_baudrate_spinbox.setRange(1, 10_000_000)
         self.tactile_baudrate_spinbox.setSingleStep(100)
@@ -803,13 +1045,19 @@ class MainWindow(QMainWindow):
         self.tactile_timeout_spinbox.setFixedWidth(100)
 
         self.tactile_threshold_spinbox.setDecimals(1)
-        self.tactile_threshold_spinbox.setRange(0.1, 9999.0)
+        self.tactile_threshold_spinbox.setRange(0.0, 65535.0)
         self.tactile_threshold_spinbox.setSingleStep(5.0)
         self.tactile_threshold_spinbox.setKeyboardTracking(False)
         self.tactile_threshold_spinbox.setSuffix(" g")
         self.tactile_threshold_spinbox.setToolTip("指尖接触力阈值，超过此值视为按压")
 
-        self.connection_config_toggle_button.setText("控制器配置")
+        self.tactile_display_threshold_slider.setFixedWidth(120)
+        self.tactile_display_threshold_slider.setToolTip("调整热力图红色对应的压力阈值")
+        self.tactile_display_threshold_value_label.setMinimumWidth(66)
+        self.tactile_display_threshold_value_label.setAlignment(Qt.AlignCenter)
+        self.tactile_display_threshold_value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        self.connection_config_toggle_button.setText("配置")
         self.connection_config_toggle_button.setCheckable(True)
         self.connection_config_toggle_button.setArrowType(Qt.RightArrow)
         self.connection_config_toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -817,7 +1065,12 @@ class MainWindow(QMainWindow):
 
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(6)
         header_layout.addWidget(self.connection_config_toggle_button)
+        header_layout.addWidget(QLabel("motor port"))
+        header_layout.addWidget(self.port_input)
+        header_layout.addWidget(QLabel("tactile port"))
+        header_layout.addWidget(self.tactile_port_input)
         header_layout.addWidget(self.zero_button)
         header_layout.addStretch()
         self.connection_config_header_widget.setLayout(header_layout)
@@ -830,22 +1083,20 @@ class MainWindow(QMainWindow):
         connection_grid.addWidget(self.ctrl_frequency_spinbox, 0, 1)
         connection_grid.addWidget(QLabel("timeout_s"), 0, 2)
         connection_grid.addWidget(self.timeout_spinbox, 0, 3)
-        connection_grid.addWidget(QLabel("port"), 1, 0)
-        connection_grid.addWidget(self.port_input, 1, 1)
+        connection_grid.addWidget(QLabel("baudrate"), 1, 0)
+        connection_grid.addWidget(self.baudrate_spinbox, 1, 1)
         connection_grid.addWidget(QLabel("write_timeout_s"), 1, 2)
         connection_grid.addWidget(self.write_timeout_spinbox, 1, 3)
-        connection_grid.addWidget(QLabel("baudrate"), 2, 0)
-        connection_grid.addWidget(self.baudrate_spinbox, 2, 1)
-        connection_grid.addWidget(QLabel("jog步长"), 2, 2)
-        connection_grid.addWidget(self.gui_step_spinbox, 2, 3)
+        connection_grid.addWidget(QLabel("jog步长"), 2, 0)
+        connection_grid.addWidget(self.gui_step_spinbox, 2, 1)
         connection_grid.addWidget(self.tactile_enabled_checkbox, 3, 0, 1, 2)
-        connection_grid.addWidget(QLabel("tactile port"), 3, 2)
-        connection_grid.addWidget(self.tactile_port_input, 3, 3)
+        connection_grid.addWidget(QLabel("tactile mode"), 3, 2)
+        connection_grid.addWidget(self.tactile_mode_combo, 3, 3)
         connection_grid.addWidget(QLabel("tactile baudrate"), 4, 0)
         connection_grid.addWidget(self.tactile_baudrate_spinbox, 4, 1)
         connection_grid.addWidget(QLabel("tactile timeout_s"), 4, 2)
         connection_grid.addWidget(self.tactile_timeout_spinbox, 4, 3)
-        connection_grid.addWidget(QLabel("tactile threshold"), 5, 0)
+        connection_grid.addWidget(self.tactile_threshold_label, 5, 0)
         connection_grid.addWidget(self.tactile_threshold_spinbox, 5, 1)
 
         footer_layout = QHBoxLayout()
@@ -857,6 +1108,9 @@ class MainWindow(QMainWindow):
         container_layout = QVBoxLayout()
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.setSpacing(6)
+        container_layout.addWidget(self.config_label)
+        container_layout.addWidget(self.config_help_label)
+        container_layout.addWidget(self.step_hint_label)
         container_layout.addLayout(connection_grid)
         container_layout.addLayout(footer_layout)
         self.connection_config_container.setLayout(container_layout)
@@ -873,22 +1127,50 @@ class MainWindow(QMainWindow):
         tactile_force_grid.setHorizontalSpacing(14)
         tactile_force_grid.setVerticalSpacing(4)
         for column, finger_name in enumerate(self.FINGERTIP_FORCE_ORDER):
+            finger_panel = QWidget()
+            finger_layout = QVBoxLayout(finger_panel)
+            finger_layout.setContentsMargins(0, 0, 0, 0)
+            finger_layout.setSpacing(3)
+
             name_label = QLabel(self.FINGERTIP_FORCE_DISPLAY_NAMES[finger_name])
             name_label.setAlignment(Qt.AlignCenter)
-            value_label = QLabel("-- g")
-            value_label.setAlignment(Qt.AlignCenter)
-            value_label.setMinimumWidth(72)
-            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            self.tactile_force_labels[finger_name] = value_label
-            tactile_force_grid.addWidget(name_label, 0, column)
-            tactile_force_grid.addWidget(value_label, 1, column)
+            matrix_widget = PressureMatrixWidget()
+            summary_label = QLabel("--")
+            summary_label.setAlignment(Qt.AlignCenter)
+            summary_label.setWordWrap(True)
+            summary_label.setMinimumWidth(88)
+            summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            force_summary_label = QLabel("Fx --  Fy --\nFn -- g")
+            force_summary_label.setAlignment(Qt.AlignCenter)
+            force_summary_label.setWordWrap(True)
+            force_summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+            finger_layout.addWidget(name_label)
+            finger_layout.addWidget(matrix_widget)
+            finger_layout.addWidget(summary_label)
+            finger_layout.addWidget(force_summary_label)
+            self.tactile_matrix_widgets[finger_name] = matrix_widget
+            self.tactile_matrix_summary_labels[finger_name] = summary_label
+            self.tactile_force_summary_labels[finger_name] = force_summary_label
+            tactile_force_grid.addWidget(finger_panel, 0, column)
+            tactile_force_grid.setColumnStretch(column, 1)
 
         self.tactile_force_status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        tactile_status_layout = QHBoxLayout()
+        tactile_status_layout.setContentsMargins(0, 0, 0, 0)
+        tactile_status_layout.setSpacing(6)
+        tactile_status_layout.addWidget(self.tactile_force_status_label)
+        tactile_status_layout.addSpacing(6)
+        tactile_status_layout.addWidget(QLabel("压力显示阈值"))
+        tactile_status_layout.addWidget(self.tactile_display_threshold_slider)
+        tactile_status_layout.addWidget(self.tactile_display_threshold_value_label)
+        tactile_status_layout.addWidget(self.tactile_color_legend, 1)
+
         tactile_force_layout = QVBoxLayout()
         tactile_force_layout.setContentsMargins(8, 8, 8, 8)
         tactile_force_layout.setSpacing(6)
         tactile_force_layout.addLayout(tactile_force_grid)
-        tactile_force_layout.addWidget(self.tactile_force_status_label)
+        tactile_force_layout.addLayout(tactile_status_layout)
         self.tactile_force_box.setLayout(tactile_force_layout)
 
         self.rows_layout.setContentsMargins(0, 0, 0, 0)
@@ -900,12 +1182,10 @@ class MainWindow(QMainWindow):
 
         main_layout.addLayout(toolbar_layout)
         main_layout.addLayout(status_layout)
-        main_layout.addWidget(self.config_label)
-        main_layout.addWidget(self.config_help_label)
-        main_layout.addWidget(self.step_hint_label)
         main_layout.addWidget(self.connection_config_box)
+        main_layout.addWidget(self.scroll_area, 1)
+        self.tactile_force_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         main_layout.addWidget(self.tactile_force_box)
-        main_layout.addWidget(self.scroll_area)
         self.setCentralWidget(central_widget)
 
     def _resize_to_minimum_start_width(self):
@@ -941,10 +1221,14 @@ class MainWindow(QMainWindow):
         self.timeout_spinbox.valueChanged.connect(self._mark_connection_config_dirty)
         self.write_timeout_spinbox.valueChanged.connect(self._mark_connection_config_dirty)
         self.tactile_enabled_checkbox.toggled.connect(self._mark_connection_config_dirty)
+        self.tactile_mode_combo.currentIndexChanged.connect(self._on_tactile_mode_changed)
         self.tactile_port_input.textChanged.connect(self._mark_connection_config_dirty)
         self.tactile_baudrate_spinbox.valueChanged.connect(self._mark_connection_config_dirty)
         self.tactile_timeout_spinbox.valueChanged.connect(self._mark_connection_config_dirty)
         self.tactile_threshold_spinbox.valueChanged.connect(self._on_threshold_changed)
+        self.tactile_display_threshold_slider.valueChanged.connect(
+            self._on_tactile_display_threshold_changed
+        )
         self.save_connection_config_button.clicked.connect(self._save_connection_config)
         self.gui_step_spinbox.valueChanged.connect(self._apply_gui_step_to_rows)
 
@@ -952,7 +1236,7 @@ class MainWindow(QMainWindow):
         self.connection_config_toggle_button.blockSignals(True)
         self.connection_config_toggle_button.setChecked(expanded)
         self.connection_config_toggle_button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
-        self.connection_config_toggle_button.setText("控制器配置")
+        self.connection_config_toggle_button.setText("配置")
         self.connection_config_toggle_button.blockSignals(False)
         self.connection_config_container.setVisible(expanded)
 
@@ -964,13 +1248,98 @@ class MainWindow(QMainWindow):
         self.timeout_spinbox.setValue(float(self.hand.motor.timeout_s))
         self.write_timeout_spinbox.setValue(float(self.hand.motor.write_timeout_s))
         self.tactile_enabled_checkbox.setChecked(bool(self.hand.tactile_config.enabled))
-        self.tactile_port_input.setText(self.hand.tactile_config.port or "auto")
-        self.tactile_baudrate_spinbox.setValue(int(self.hand.tactile_config.baudrate))
-        self.tactile_timeout_spinbox.setValue(float(self.hand.tactile_config.timeout_s))
-        self.tactile_threshold_spinbox.setValue(float(self.hand.tactile_config.contact_threshold_g))
+        mode_index = self.tactile_mode_combo.findData(self.hand.tactile_config.mode)
+        self.tactile_mode_combo.setCurrentIndex(max(0, mode_index))
+        self._load_tactile_mode_fields(self.hand.tactile_config.mode)
         self._syncing_connection_config = False
         self._connection_config_dirty = False
         self.connection_config_status_label.setText(status_text)
+
+    def _load_tactile_mode_fields(self, mode: str):
+        if mode == "hwk":
+            config = self.hand.tactile_config.hwk
+            port = config.port
+            baudrate = config.baudrate
+            timeout_s = config.response_timeout_s
+            threshold = config.contact_threshold_g
+            self.tactile_threshold_spinbox.setDecimals(1)
+            self.tactile_threshold_spinbox.setSingleStep(1.0)
+            self.tactile_threshold_spinbox.setSuffix(" g")
+            self.tactile_threshold_label.setText("contact threshold")
+            self.tactile_force_box.setTitle("Fingertip Pressure Matrix & Force Summary (g)")
+        else:
+            config = self.hand.tactile_config.fsr402
+            port = config.port
+            baudrate = config.baudrate
+            timeout_s = config.timeout_s
+            threshold = config.contact_threshold_g
+            self.tactile_threshold_spinbox.setDecimals(1)
+            self.tactile_threshold_spinbox.setSingleStep(5.0)
+            self.tactile_threshold_spinbox.setSuffix(" g")
+            self.tactile_threshold_label.setText("force threshold")
+            self.tactile_force_box.setTitle("Fingertip Contact Force (g)")
+        self.tactile_port_input.setText(port or "auto")
+        self.tactile_baudrate_spinbox.setValue(int(baudrate))
+        self.tactile_timeout_spinbox.setValue(float(timeout_s))
+        self.tactile_threshold_spinbox.setValue(float(threshold))
+        for force_summary_label in self.tactile_force_summary_labels.values():
+            force_summary_label.setVisible(mode == "hwk")
+        self._configure_tactile_display_threshold(mode)
+
+    def _configure_tactile_display_threshold(self, mode: str):
+        if mode == "fsr402":
+            self._tactile_display_slider_scale = 10.0
+            minimum_threshold = 0.1
+            unit = "g"
+        else:
+            self._tactile_display_slider_scale = 1.0
+            minimum_threshold = 1.0
+            unit = "g"
+
+        maximum_threshold = 256.0
+        threshold = min(
+            maximum_threshold,
+            max(
+                minimum_threshold,
+                float(self._tactile_display_thresholds.get(mode, minimum_threshold)),
+            ),
+        )
+        self.tactile_display_threshold_slider.blockSignals(True)
+        self.tactile_display_threshold_slider.setRange(
+            max(1, int(round(minimum_threshold * self._tactile_display_slider_scale))),
+            max(1, int(round(maximum_threshold * self._tactile_display_slider_scale))),
+        )
+        self.tactile_display_threshold_slider.setValue(
+            int(round(threshold * self._tactile_display_slider_scale))
+        )
+        self.tactile_display_threshold_slider.blockSignals(False)
+        self._apply_tactile_display_threshold(threshold, unit)
+
+    def _on_tactile_display_threshold_changed(self, slider_value: int):
+        threshold = float(slider_value) / self._tactile_display_slider_scale
+        mode = str(self.tactile_mode_combo.currentData() or self.hand.tactile_mode)
+        self._tactile_display_thresholds[mode] = threshold
+        self._apply_tactile_display_threshold(threshold, "g")
+
+    def _apply_tactile_display_threshold(self, threshold: float, unit: str):
+        decimals = 1 if unit == "g" else 0
+        self.tactile_display_threshold_value_label.setText(
+            f"{threshold:.{decimals}f} {unit}"
+        )
+        for matrix_widget in self.tactile_matrix_widgets.values():
+            matrix_widget.set_display_threshold(threshold)
+        self.tactile_color_legend.set_threshold(threshold, unit)
+
+    def _on_tactile_mode_changed(self, _index: int):
+        if self._syncing_connection_config:
+            return
+        mode = self.tactile_mode_combo.currentData()
+        if mode not in {"fsr402", "hwk"}:
+            return
+        self._syncing_connection_config = True
+        self._load_tactile_mode_fields(mode)
+        self._syncing_connection_config = False
+        self._mark_connection_config_dirty()
 
     def _mark_connection_config_dirty(self, *_args):
         if self._syncing_connection_config:
@@ -985,6 +1354,7 @@ class MainWindow(QMainWindow):
         self.timeout_spinbox.setEnabled(enabled)
         self.write_timeout_spinbox.setEnabled(enabled)
         self.tactile_enabled_checkbox.setEnabled(enabled)
+        self.tactile_mode_combo.setEnabled(enabled)
         self.tactile_port_input.setEnabled(enabled)
         self.tactile_baudrate_spinbox.setEnabled(enabled)
         self.tactile_timeout_spinbox.setEnabled(enabled)
@@ -1010,6 +1380,7 @@ class MainWindow(QMainWindow):
                 self.tactile_baudrate_spinbox.value(),
                 self.tactile_timeout_spinbox.value(),
                 contact_threshold_g=self.tactile_threshold_spinbox.value(),
+                mode=self.tactile_mode_combo.currentData(),
             )
             self.hand.save_config()
             self._load_connection_config_fields("已保存")
@@ -1285,54 +1656,109 @@ class MainWindow(QMainWindow):
     def _set_status(self, message: str):
         self.status_label.setText(message)
 
-    def _set_tactile_force_values(self, forces: Optional[list[float]], status_text: str):
-        force_values = forces if forces is not None else [-1.0] * len(self.FINGERTIP_FORCE_ORDER)
-        for index, finger_name in enumerate(self.FINGERTIP_FORCE_ORDER):
-            label = self.tactile_force_labels.get(finger_name)
-            if label is None:
+    def _format_connection_status(self, motor_connected: bool, tactile_connected: bool) -> str:
+        motor_text = "电机已连接" if motor_connected else "电机未连接"
+        if not self.hand.tactile_config.enabled:
+            tactile_text = "触觉传感器未启用"
+        else:
+            tactile_text = "触觉传感器已连接" if tactile_connected else "触觉传感器未连接"
+        return f"{motor_text}，{tactile_text}"
+
+    def _set_tactile_matrix_values(
+        self,
+        matrices: Optional[Dict[str, Any]],
+        status_text: str,
+        unit: Optional[str] = None,
+        force_summaries: Optional[Dict[str, Dict[str, Any]]] = None,
+    ):
+        matrix_map = matrices or {}
+        force_summary_map = force_summaries or {}
+        display_unit = self.hand.tactile_unit if unit is None else str(unit)
+        display_threshold = (
+            float(self.tactile_display_threshold_slider.value())
+            / self._tactile_display_slider_scale
+        )
+        for finger_name in self.FINGERTIP_FORCE_ORDER:
+            matrix_widget = self.tactile_matrix_widgets.get(finger_name)
+            summary_label = self.tactile_matrix_summary_labels.get(finger_name)
+            force_summary_label = self.tactile_force_summary_labels.get(finger_name)
+            if matrix_widget is None or summary_label is None:
                 continue
 
-            try:
-                force_g = float(force_values[index])
-            except (IndexError, TypeError, ValueError):
-                force_g = -1.0
-
-            if force_g < 0:
-                label.setText("ERR")
-                label.setStyleSheet("color: #777;")
-            elif force_g > self.contact_threshold_g:
-                label.setText(f"{force_g:.1f} g")
-                label.setStyleSheet("color: #0a7f35; font-weight: 600;")
+            matrix_widget.set_display_threshold(display_threshold)
+            matrix_widget.set_matrices(matrix_map.get(finger_name), display_unit)
+            summary_label.setText(matrix_widget.summary_text())
+            values = matrix_widget.values()
+            valid_values = [value for value in values if value >= 0]
+            if valid_values and max(valid_values) > self.contact_threshold_g:
+                summary_label.setStyleSheet("color: #0a7f35; font-weight: 600;")
+            elif valid_values:
+                summary_label.setStyleSheet("")
             else:
-                label.setText(f"{force_g:.1f} g")
-                label.setStyleSheet("")
+                summary_label.setStyleSheet("color: #777;")
+
+            if force_summary_label is not None:
+                force_summary_label.setVisible(self.hand.tactile_mode == "hwk")
+                summary = force_summary_map.get(finger_name, {})
+                if summary:
+                    fx = float(summary.get("Fx", 0.0))
+                    fy = float(summary.get("Fy", 0.0))
+                    normal = float(summary.get("Fnormal_sum", 0.0))
+                    force_summary_label.setText(
+                        f"Fx {fx:.1f}  Fy {fy:.1f}\nFn {normal:.1f} g"
+                    )
+                    force_summary_label.setToolTip(
+                        f"Fx: {fx:.3f} g\nFy: {fy:.3f} g\nFnormal_sum: {normal:.3f} g"
+                    )
+                else:
+                    force_summary_label.setText("Fx --  Fy --\nFn -- g")
+                    force_summary_label.setToolTip("等待 Fx、Fy、Fnormal_sum 力汇总数据")
 
         self.tactile_force_status_label.setText(status_text)
 
     def _refresh_tactile_feedback(self):
         if not self.hand.tactile_config.enabled:
-            self._set_tactile_force_values(None, "触觉未启用")
+            self._set_tactile_matrix_values(None, "触觉未启用")
             return
         if not self.hand.tactile_connected:
-            self._set_tactile_force_values(None, "触觉未连接")
+            self._set_tactile_matrix_values(None, "触觉未连接")
             return
 
         try:
-            forces = self.hand.get_tactile_forces()
+            snapshot = self.hand.get_tactile_snapshot()
         except Exception as exc:
-            self._set_tactile_force_values(None, f"触觉读取失败: {exc}")
+            self._set_tactile_matrix_values(None, f"触觉读取失败: {exc}")
             return
 
-        valid_count = sum(1 for force_g in forces if force_g >= 0)
-        contact_count = sum(1 for force_g in forces if force_g > self.contact_threshold_g)
+        if snapshot is None:
+            self._set_tactile_matrix_values(
+                None,
+                f"{self.hand.tactile_mode} | 等待触觉矩阵数据",
+            )
+            return
+
+        value_map = snapshot.value_map
+        finger_values = [float(value_map.get(name, -1.0)) for name in self.FINGERTIP_FORCE_ORDER]
+        valid_count = sum(1 for value in finger_values if value >= 0)
+        contact_count = sum(1 for value in finger_values if value > self.contact_threshold_g)
         if valid_count == 0:
-            status_text = "等待触觉数据"
+            status_text = f"{snapshot.mode} | 等待触觉矩阵数据"
         else:
-            status_text = f"触觉读取中 | 接触 {contact_count}/5 | 有效 {valid_count}/5"
-        self._set_tactile_force_values(forces, status_text)
+            status_text = (
+                f"{snapshot.mode} | 接触 {contact_count}/5 | "
+                f"有效矩阵 {valid_count}/5 | 单位 {snapshot.unit}"
+            )
+        self._set_tactile_matrix_values(
+            snapshot.matrices,
+            status_text,
+            snapshot.unit,
+            snapshot.force_summaries,
+        )
 
     def _on_threshold_changed(self, value: float):
         """当用户在 UI 中修改按压阈值时，同步更新 config 中的值。"""
+        if self._syncing_connection_config:
+            return
         try:
             self.hand.update_tactile_config(
                 self.tactile_enabled_checkbox.isChecked(),
@@ -1340,6 +1766,7 @@ class MainWindow(QMainWindow):
                 self.tactile_baudrate_spinbox.value(),
                 self.tactile_timeout_spinbox.value(),
                 contact_threshold_g=value,
+                mode=self.tactile_mode_combo.currentData(),
             )
             self.hand.save_config()
             self.connection_config_status_label.setText("已保存")
@@ -1365,21 +1792,18 @@ class MainWindow(QMainWindow):
                     self.feedback_timer.start()
                     self._refresh_feedback()
                 self._set_connection_state(True)
-                parts = ["已连接"]
-                if self.hand.tactile_config.enabled and not tactile_ok:
-                    parts.append("触觉传感器未连接")
-                self._set_status("，".join(parts))
+                self._set_status(self._format_connection_status(True, tactile_ok))
             elif tactile_ok:
                 self.feedback_timer.start()
                 self.connect_button.setEnabled(False)
                 self.disconnect_button.setEnabled(True)
                 self._set_connection_config_editable(False)
-                self._set_status("电机未连接，触觉传感器已连接")
+                self._set_status(self._format_connection_status(False, True))
             else:
                 extra = ""
                 if self.hand.tactile_config.enabled:
                     extra = "，触觉传感器也未连接"
-                self._set_status(f"连接失败{extra}")
+                self._set_status(self._format_connection_status(False, False))
                 QMessageBox.warning(self, "连接失败", f"未能连接到电机控制系统{extra}。")
                 return
         except Exception as exc:
@@ -1409,7 +1833,7 @@ class MainWindow(QMainWindow):
             self._apply_control_mode_to_rows()
             self._refresh_tactile_feedback()
             if was_connected:
-                self._set_status("已断开")
+                self._set_status(self._format_connection_status(False, False))
 
     def _toggle_enable(self, enabled: bool):
         if not self.hand.connected:

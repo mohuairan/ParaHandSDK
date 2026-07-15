@@ -1,125 +1,324 @@
-# FSR402 五路压力传感器检测系统
+# ParaHandSDK
 
-基于 STM32F103C8T6 (Blue Pill) + FSR402 薄膜压力传感器 + 压力转换模块的五路实时压力检测系统。
+ParaHand 灵巧手 Python SDK，包含电机控制、hand-position 控制，以及两种可切换的触觉传感器：
 
-## 硬件连接
+- **fsr402**：五路 FSR402 薄膜压力传感器，输出单位为克（g）。
+- **hwk**：华威科阵列触觉传感器，输出内部标定后的克重压力矩阵，以及 `Fx / Fy / Fnormal_sum` 三项克重力汇总。
 
-### 传感器通道
+传感器模式可以通过 config_hand.yaml、Python API 或 GUI 选择。两种驱动都通过统一的 start、stop、read 生命周期接入 ParaHand。
+
+## 1. 安装
+
+基础串口和配置依赖：
+
+~~~powershell
+python -m pip install pyserial pyyaml
+~~~
+
+运行 GUI 还需要：
+
+~~~powershell
+python -m pip install PySide6
+~~~
+
+本仓库目前没有 setup.py 或 pyproject.toml，请在仓库根目录运行示例和测试。
+
+## 2. 触觉模式配置
+
+两种传感器分别保存连接参数，切换模式时不需要反复修改波特率：
+
+~~~yaml
+tactile:
+  enabled: true
+  mode: fsr402              # fsr402 或 hwk
+
+  fsr402:
+    port: COM8              # auto 表示自动选择
+    baudrate: 115200
+    timeout_s: 1.0
+    contact_threshold_g: 50.0
+    channel_fingers:
+    - thumb
+    - index
+    - middle
+    - ring
+    - little
+
+  hwk:
+    port: COM9
+    baudrate: 921600
+    response_timeout_s: 0.2
+    write_timeout_s: 0.2
+    poll_interval_s: 0.0
+    contact_threshold_g: 100
+    device_regions:
+      1: thumb
+      2: index
+      3: middle
+      4: ring
+      5: little
+      6: palm
+~~~
+
+device_regions 是设备 ID 到手指或掌心的显式映射。上例采用 1..6 对应五指加掌心的默认顺序；如果实物地址不同，应按实际接线修改。
+
+旧版 FSR402 平铺配置仍可读取。一旦通过 GUI 或 update_tactile_config() 保存，会迁移为新的分模式结构。
+
+## 3. 统一 Python API
+
+### 按配置启动
+
+~~~python
+import time
+from parahand import ParaHand
+
+hand = ParaHand("config_hand.yaml")
+
+if not hand.start_tactile():
+    raise RuntimeError(hand.last_tactile_error)
+
+try:
+    while True:
+        snapshot = hand.get_tactile_snapshot()
+        if snapshot is not None:
+            print(snapshot.mode, snapshot.unit, snapshot.value_map)
+        time.sleep(0.05)
+finally:
+    hand.stop_tactile()
+~~~
+
+当 tactile.enabled 为 true 时，hand.connect() 也会自动启动所选触觉模式。触觉串口与电机串口相互独立。
+
+调用时可以覆盖模式和串口：
+
+~~~python
+hand.start_tactile(mode="fsr402", port="COM8")
+hand.start_tactile(mode="hwk", port="COM9")
+~~~
+
+正在运行时切换模式，SDK 会先停止旧驱动，再启动新驱动。
+
+### 统一快照
+
+get_tactile_snapshot() 返回 TactileSnapshot：
+
+| 字段 | 说明 |
+|---|---|
+| mode | fsr402 或 hwk |
+| timestamp | 最新区域数据的 Unix 时间 |
+| unit | 两种模式均为 g |
+| regions | 区域名到 TactileRegion 的映射 |
+| value_map | 区域名到代表值的映射 |
+| matrices | 区域名到空间压力二维矩阵的映射；不包含力汇总包 |
+| force_summaries | 区域名到 Fx、Fy、Fnormal_sum 的映射，单位为 g |
+| raw | 对应驱动的原生数据 |
+
+TactileRegion.representative_value 用于 GUI 和阈值判断：
+
+- FSR402：该通道的克重值。
+- 华威科：主空间压力矩阵中的最大克重值。
+
+华威科代表值只用于状态显示。需要空间分布时，应读取完整矩阵：
+
+~~~python
+snapshot = hand.get_tactile_snapshot()
+if snapshot and snapshot.mode == "hwk":
+    for region, matrices in snapshot.matrices.items():
+        print(region, matrices)
+    for region, summary in snapshot.force_summaries.items():
+        print(region, summary)  # Fx、Fy、Fnormal_sum，单位 g
+
+matrix_map = hand.get_tactile_matrices()
+force_summary_map = hand.get_tactile_force_summaries()
+~~~
+
+### 五指兼容接口
+
+~~~python
+values = hand.get_tactile_values()
+# 固定顺序：thumb, index, middle, ring, little
+~~~
+
+以下旧接口继续可用：
+
+~~~python
+hand.get_tactile_forces()
+hand.get_fingertip_forces()
+hand.get_tactile_force_map()
+hand.get_tactile_frame()
+~~~
+
+旧方法名继续可用；华威科模式返回主压力矩阵最大克重值，单位为 g。
+
+### 示例和 GUI
+
+~~~powershell
+python example.py
+python example.py --tactile-mode fsr402 --tactile-port COM8
+python example.py --tactile-mode hwk --tactile-port COM9
+~~~
+
+GUI 的“控制器配置”区域提供 FSR402 / 华威科下拉框。华威科模式显示五指压力矩阵，并分别显示 `Fx / Fy / Fnormal_sum`；所有数值单位均为 g。
+
+## 4. FSR402 接口
+
+### 硬件连接
+
+五路输出连接到 STM32F103C8T6 ADC：
 
 | 通道 | FSR402 AO | STM32 ADC 引脚 |
 |---|---|---|
-| CH0 | AO | **PA0** (ADC1_IN0) |
-| CH1 | AO | **PA1** (ADC1_IN1) |
-| CH2 | AO | **PA2** (ADC1_IN2) |
-| CH3 | AO | **PA3** (ADC1_IN3) |
-| CH4 | AO | **PA4** (ADC1_IN4) |
+| CH0 | AO | PA0 / ADC1_IN0 |
+| CH1 | AO | PA1 / ADC1_IN1 |
+| CH2 | AO | PA2 / ADC1_IN2 |
+| CH3 | AO | PA3 / ADC1_IN3 |
+| CH4 | AO | PA4 / ADC1_IN4 |
 | 全部 | VCC | 3.3V |
 | 全部 | GND | GND |
 
-### LED 指示
+CH340 USB-TTL 连接：
 
-| LED | STM32 引脚 | 说明 |
-|---|---|---|
-| 板载 LED | **PC13** | 任意一路按压即亮，低电平有效 |
-
-### 串口通信
-
-| CH340 USB-TTL | STM32 Blue Pill |
+| CH340 | STM32 |
 |---|---|
-| RX | **PA9** (USART1 TX) |
-| TX | **PA10** (USART1 RX) |
+| RX | PA9 / USART1 TX |
+| TX | PA10 / USART1 RX |
 | GND | GND |
 
-### 烧录
+压力换算：
 
-| ST-Link | STM32 Blue Pill |
-|---|---|
-| SWDIO | PA13 |
-| SWCLK | PA14 |
-| 3.3V | 3.3V |
-| GND | GND |
+~~~text
+Vout = 0.0004 × F(g) + 0.4749
+F(g) = (V_FSR - 0.4749) / 0.0004
+V_FSR = VCC - V_AO
+~~~
 
-## 系统架构
+串口约每 200 ms 输出一组逐行数据：
 
-```
-┌──────────────────┐    5ch ADC     ┌────────────┐    串口USART1    ┌──────────┐    Python    ┌──────────────┐
-│  FSR402 ×5       │ ──────────────►│ STM32F103  │ ◄──────────────►│  CH340   │ ◄───────────►│  上位机/PC   │
-│  压力转换模块 ×5   │    PA0~PA4     │  Blue Pill │   简洁逐行输出    │ USB-TTL  │  fsr402.py  │              │
-└──────────────────┘                └────────────┘                  └──────────┘              └──────────────┘
-```
-
-## 压力转换
-
-**公式**：`Vout = 0.0004 × F(g) + 0.4749`
-
-```
-F(g) = (V_FSR − 0.4749) / 0.0004
-  其中 V_FSR = VCC − V_AO
-```
-
-- 量程：约 6 kg / 路
-- ADC：12-bit (0–4095)，参考电压 3.3V，8 次滑动平均
-- 按压阈值：50g（可在源码中修改 `PRESS_THRESHOLD_G`）
-- 异常检测：连续 3 次采样超出 [-100, 6500] g 范围则上报 -1
-
-## 串口协议
-
-每 200ms 输出一组数据，每行对应一个传感器通道：
-
-```
+~~~text
 PA0,60.0
 PA1,-1
 PA2,-1
 PA3,-1
 PA4,-1
-```
+~~~
 
-| 格式 | 说明 |
-|---|---|
-| `PAx,<数值>` | 正常通道，数值为压力 (g)，保留一位小数 |
-| `PAx,-1` | 异常/未连接通道 |
+- PAx,数值：压力克重。
+- PAx,-1：异常或未连接。
+- FSR402 驱动默认接触阈值为 50 g；ParaHand 和 GUI 使用 contact_threshold_g 配置。
 
-## 编译烧录
+### 原生 API
 
-```bash
-pio run                    # 编译
-pio run --target upload    # 烧录 (ST-Link)
-```
+~~~python
+from fsr402_sensor import FSR402Sensor
 
-## Python SDK
+with FSR402Sensor(port="COM8") as sensor:
+    frame = sensor.read_blocking(timeout_s=5.0)
+    if frame:
+        print(frame.forces)
+        print(frame.contacts)
+        print(frame.any_contact)
+        print(frame.contact_count)
+~~~
 
-### 安装
+SensorFrame 提供 channels、forces、contacts、any_contact、contact_count、timestamp、to_dict() 和 to_json()。
 
-```bash
-pip install pyserial
-```
+原生命令行监视：
 
-### ParaHand hand-position 接口
+~~~powershell
+python fsr402_sensor.py --port COM8
+python fsr402_sensor.py --port COM8 --json
+~~~
 
-`ParaHand` 提供两类控制/读取语义：
+## 5. 华威科接口
 
-- `set_joint_positions()` / `get_joint_feedback()`：关节/电机角度语义，输入和反馈单位为度，适合调试单个电机或做底层校准。
-- `set_hand_position_map()` / `get_hand_position_map()`：整手姿态语义，普通关节单位为弧度，`pip_dip` 表示 tendon length，单位为米。
+### 串口和协议
 
-> 部署策略注意：MuJoCo `ParaHandGraspArm` deploy 只应调用 `get_hand_positions()`、`set_hand_positions_broadcast()` 或 `set_hand_positions()` 这类 hand-position 接口。`pip_dip` 值按 tendon length 直接传入，不要使用 teleop 中的 `0.025 - tendon_m` 反向变换。
+默认行为：
 
-hand-position 语义覆盖 16 个关节：
+- 921600 / 8N1，无软硬件流控。
+- 主从模式，设备 ID 在高 4 位、通道在低 4 位。
+- 数据通道为 0x02，轮询负载为 0x01，归零通道为 0x07。
+- CRC16 初值为 0，多项式为 0xA001，校验范围为负载。
+- 同时接受协议正文 ACK 0b11 和示例设备 ACK 0b10。
+- 增量解析器支持拆包、粘包、前导噪声、CRC 错误和重新同步。
 
-| 手指 | hand-position 字段 | 单位 |
-|---|---|---|
-| thumb | `thumb.cmc_1`, `thumb.cmc_2`, `thumb.mcp`, `thumb.ip` | rad |
-| index | `index.mcp_1`, `index.mcp_2` | rad |
-| index | `index.pip_dip` | tendon length, m |
-| middle | `middle.mcp_1`, `middle.mcp_2` | rad |
-| middle | `middle.pip_dip` | tendon length, m |
-| ring | `ring.mcp_1`, `ring.mcp_2` | rad |
-| ring | `ring.pip_dip` | tendon length, m |
-| little | `little.mcp_1`, `little.mcp_2` | rad |
-| little | `little.pip_dip` | tendon length, m |
+Windows 存在多个 COM 口时，应显式配置 port，避免连接到电机或其他串口。
 
-#### 按关节名控制
+### 原生 API
 
-```python
+~~~python
+from hwk_tactile import TactileSensorBus
+
+with TactileSensorBus("COM9", response_timeout=0.2) as bus:
+    reading = bus.poll_device(1)
+    for packet in reading.packets:
+        print(packet.rows, packet.columns, packet.bytes_per_value)
+        print(packet.matrix)
+~~~
+
+轮询多个设备：
+
+~~~python
+with TactileSensorBus("COM9") as bus:
+    readings = bus.poll_devices(range(1, 7), ignore_timeouts=True)
+~~~
+
+持续读取：
+
+~~~python
+with TactileSensorBus("COM9") as bus:
+    for reading in bus.iter_readings(range(1, 7)):
+        for packet in reading.packets:
+            if packet.data_type == "pressure_map":
+                consume_pressure(reading.device_id, packet.matrix, packet.unit)
+            elif packet.data_type == "force_summary":
+                consume_force(reading.device_id, dict(zip(packet.labels, packet.values)))
+~~~
+
+归零校准：
+
+~~~python
+hand.start_tactile(mode="hwk")
+hand.calibrate_tactile(device_id=1, command=2)
+~~~
+
+command 为 0 表示关闭归零，1 表示开启归零，2 表示重新校准。
+
+### 数据含义和限制
+
+基础负载格式：
+
+~~~text
+总包数 | 当前包序号 | 列数 | 行数 | rows × columns 个 uint16 小端值
+~~~
+
+实机也可能在同一负载中连续返回多个数据块：
+
+~~~text
+总块数 | 块1序号 | 列 | 行 | 块1数据 | 块2序号 | 列 | 行 | 块2数据 | ...
+~~~
+
+接口同时支持单帧单块、多帧分块和同帧复合块，并动态使用响应中的行列数和 PressurePacket.bytes_per_value。
+
+2026-07-14 的 ID 1 实机响应包含 `8×4 / uint16 / g` 空间压力块与一个力汇总包。力汇总包头部的 `03 04` 表示三个分量、每项四字节，后续 12 字节依次按小端 IEEE-754 `float32` 解析为 `Fx`、`Fy` 和 `Fnormal_sum`，单位均为 g；不能按三个 `int32` 解析。
+
+厂家确认传感器内部已经完成标定，主机端不应再次应用零点或增益标定：
+
+- PressurePacket.values 是一维传感器输出。
+- PressurePacket.matrix 是按行优先整理的二维矩阵。
+- PressurePacket.unit 给出物理单位；当前空间矩阵和力汇总均为 g。
+- PressurePacket.data_type 区分 `pressure_map` 与 `force_summary`。
+- `force_summary` 的 PressurePacket.labels 固定为 `Fx / Fy / Fnormal_sum`。
+- 空间扫描方向和传感器有效量程仍待确认。
+
+## 6. ParaHand hand-position 接口
+
+ParaHand 保留两类电机控制语义：
+
+- set_joint_positions() / get_joint_feedback()：关节角度，单位为度。
+- set_hand_position_map() / get_hand_position_map()：整手姿态；普通关节为弧度，pip_dip 为 tendon length，单位为米。
+
+~~~python
 import math
 from parahand import ParaHand
 
@@ -129,143 +328,35 @@ hand.start_polling()
 hand.enable()
 
 positions = {name: 0.0 for name in hand.get_hand_joint_order()}
-
-# thumb 4 motors: all values are radians.
 positions["thumb.cmc_1"] = math.radians(10.0)
-positions["thumb.cmc_2"] = math.radians(-20.0)
-positions["thumb.mcp"] = math.radians(30.0)
-positions["thumb.ip"] = math.radians(25.0)
-
-# Other fingers: mcp_1/mcp_2 are radians, pip_dip is tendon length in meters.
-positions["index.mcp_1"] = math.radians(-3.0)
 positions["index.mcp_2"] = math.radians(35.0)
 positions["index.pip_dip"] = 0.012
+hand.set_hand_position_map(positions)
+~~~
 
-command_ids = hand.set_hand_position_map(positions)
-```
+固定顺序数组可使用 set_hand_positions()。MuJoCo 部署应使用 hand-position 系列接口；pip_dip 直接传 tendon length，不要套用 teleop 中的反向变换。
 
-`set_hand_position_map()` 会先将 hand-position 语义转换为关节角度，再走原有电机控制链路。普通关节执行 `rad -> deg`；`pip_dip` 会结合同一手指的 `mcp_2` 角度做 tendon 补偿。
+## 7. 测试
 
-#### 按固定顺序控制
+统一传感器层测试不需要硬件：
 
-`set_hand_positions()` 仍然可用，适合 teleop 等已经按数组输出的流程。顺序来自 `hand.get_hand_joint_order()`：
+~~~powershell
+python -m unittest discover -s tests -v
+~~~
 
-```python
-positions = [0.0] * len(hand.get_hand_joint_order())
-positions[0] = math.radians(10.0)  # thumb.cmc_1
-positions[5] = math.radians(35.0)  # index.mcp_2
-positions[6] = 0.012               # index.pip_dip tendon length, m
-hand.set_hand_positions(positions)
-```
+测试覆盖 FSR402 映射和克重快照、华威科后台轮询和矩阵、归零调用、模式切换以及两套配置互不覆盖。
 
-当前默认配置顺序为：
+真实串口验证仍需对应硬件，并应重点确认 COM 口、华威科设备 ID 映射和压力矩阵方向。
 
-```text
-thumb.cmc_1, thumb.cmc_2, thumb.mcp, thumb.ip,
-index.mcp_1, index.mcp_2, index.pip_dip,
-middle.mcp_1, middle.mcp_2, middle.pip_dip,
-ring.mcp_1, ring.mcp_2, ring.pip_dip,
-little.mcp_1, little.mcp_2, little.pip_dip
-```
-
-#### 读取 hand-position 反馈
-
-```python
-hand_feedback = hand.get_hand_position_map()
-
-# thumb values are radians.
-thumb_ip_rad = hand_feedback["thumb.ip"]
-
-# pip_dip values are compensated tendon length in meters.
-index_tendon_m = hand_feedback["index.pip_dip"]
-```
-
-读取时 `ParaHand` 先从电机反馈得到角度，再将普通关节转换为弧度；对 `pip_dip`，会使用同一手指的 `mcp_2` 反馈角度扣除补偿角，再反算 tendon length。也就是说，如果补偿机制让 `pip_dip` 电机多转了 10 度，反算 tendon length 时会先减去这 10 度。
-
-也可以读取固定顺序数组：
-
-```python
-positions = hand.get_hand_positions()
-```
-
-无反馈或关节未启用时，对应值为 `None`。可用 `hand.get_hand_position_units()` 查询每个字段的单位。
-
-#### 补偿换算接口
-
-需要单独调试 tendon 补偿时，可以直接使用：
-
-```python
-angle_deg = hand.pip_dip_tendon_length_to_angle_deg(
-    mcp_2_angle_rad=math.radians(35.0),
-    tendon_length_m=0.012,
-)
-
-tendon_m = hand.pip_dip_angle_to_tendon_length_m(
-    mcp_2_angle_rad=math.radians(35.0),
-    pip_dip_angle_deg=angle_deg,
-)
-```
-
-`pip_dip_tendon_length_to_angle_deg()` 是控制方向，`pip_dip_angle_to_tendon_length_m()` 是读取方向，两者使用同一套补偿模型。
-
-### 快速开始
-
-```python
-from fsr402_sensor import FSR402Sensor
-
-with FSR402Sensor(port="COM7") as sensor:
-    while True:
-        frame = sensor.read()
-        if frame:
-            # 五路压力值（-1 表示异常）
-            print(frame.forces)      # [60.0, -1.0, -1.0, -1.0, -1.0]
-            # 按压状态
-            print(frame.contacts)    # [True, False, False, False, False]
-            # 是否有人正在按压
-            print(frame.any_contact) # True
-            # 按压路数
-            print(frame.contact_count) # 1
-```
-
-### SensorFrame 属性
-
-| 属性 / 方法 | 类型 | 说明 |
-|---|---|---|
-| `channels` | `list[ChannelReading]` | 五路读数（固定 5 个元素） |
-| `forces` | `list[float]` | 五路压力 (g)，-1 表示异常 |
-| `contacts` | `list[bool]` | 五路按压状态（>50g 为 True） |
-| `any_contact` | `bool` | 任意一路按压 |
-| `contact_count` | `int` | 按压路数 |
-| `timestamp` | `float` | 接收时间 (Unix) |
-| `to_dict()` | `dict` | 字典化 |
-| `to_json()` | `str` | JSON 字符串 |
-
-### ChannelReading 属性
-
-| 属性 | 类型 | 说明 |
-|---|---|---|
-| `channel` | `int` | 通道号 0–4 |
-| `force_g` | `float` | 压力 (g)，-1 表示异常/未连接 |
-| `is_anomaly` | `bool` | 是否异常通道 |
-| `contact` | `bool` | 是否按压（>50g） |
-
-### 命令行测试
-
-```bash
-python fsr402_sensor.py --port COM7           # 文本输出
-python fsr402_sensor.py --port COM7 --json    # JSON 输出
-```
-
-输出示例：
-```
-[14:30:02] CH0:    60g ● | CH1: ERR | CH2: ERR | CH3: ERR | CH4: ERR
-[14:30:02] CH0:   100g ● | CH1:  50g ● | CH2: ERR | CH3: ERR | CH4:   30g ○
-```
-
-## 项目文件
+## 8. 相关文件
 
 | 文件 | 说明 |
 |---|---|
-| `src/main.cpp` | STM32 五路采集固件 |
-| `fsr402_sensor.py` | Python SDK |
-| `platformio.ini` | PlatformIO 构建配置 |
+| parahand.py | 灵巧手主接口和触觉模式接入 |
+| tactile_sensor.py | 统一模型、适配器和工厂 |
+| fsr402_sensor.py | FSR402 原生驱动 |
+| hwk_tactile/ | 华威科协议、串口总线和异常类型 |
+| config_hand.yaml | 电机和双模式触觉配置 |
+| example.py | 控制及模式选择示例 |
+| gui_app.py | 带模式选择的 GUI |
+| tests/ | 无硬件单元测试 |

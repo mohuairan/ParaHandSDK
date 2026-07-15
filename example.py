@@ -1,13 +1,32 @@
 from __future__ import annotations
 
+import argparse
 import math
 import time
 from pathlib import Path
+from typing import Optional, Sequence
 
 from parahand import ParaHand
 
 
-def main() -> int:
+def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="ParaHand 控制与双模式触觉读取示例")
+    parser.add_argument(
+        "--tactile-mode",
+        choices=("fsr402", "hwk"),
+        default=None,
+        help="覆盖 config_hand.yaml 中的 tactile.mode",
+    )
+    parser.add_argument(
+        "--tactile-port",
+        default=None,
+        help="覆盖当前触觉模式配置的串口，例如 COM8",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = _parse_args(argv)
     config_path = Path(__file__).with_name("config_hand.yaml")
     hand = ParaHand(str(config_path))
 
@@ -21,6 +40,14 @@ def main() -> int:
         return 1
 
     try:
+        if args.tactile_mode is not None:
+            tactile_ok = hand.start_tactile(
+                mode=args.tactile_mode,
+                port=args.tactile_port,
+            )
+            if not tactile_ok:
+                print(f"触觉传感器启动失败: {hand.last_tactile_error}")
+
         print("连接成功，开始轮询反馈")
         hand.start_polling()
         time.sleep(0.2)
@@ -58,8 +85,25 @@ def main() -> int:
         print("\n示例 4：按关节读取当前位置（单位：度）")
         print(hand.get_joint_positions())
 
-        print("\n示例 5：读取五指指尖受力（单位：g，顺序 thumb/index/middle/ring/little）")
-        print(hand.get_tactile_forces())
+        print("\n示例 5：读取触觉数据")
+        snapshot = hand.get_tactile_snapshot()
+        if snapshot is None:
+            print("尚无触觉数据；请检查 tactile.enabled、mode 和串口配置")
+        else:
+            print(f"模式: {snapshot.mode}, 代表值单位: {snapshot.unit}")
+            print("五指代表值:", hand.get_tactile_values())
+            if snapshot.mode == "hwk":
+                matrix_shapes = {
+                    region: [
+                        (len(matrix), len(matrix[0]) if matrix else 0)
+                        for matrix in matrices
+                    ]
+                    for region, matrices in snapshot.matrices.items()
+                }
+                print("华威科各区域矩阵尺寸:", matrix_shapes)
+                print("华威科各区域力汇总 (g):", hand.get_tactile_force_summaries())
+            else:
+                print("FSR402 原始帧:", hand.get_tactile_frame())
 
         print("\n示例 6：单个关节调零接口（实际走 jog/零位流程请按硬件协议使用）")
         print("这里仅演示调用，不默认执行。")

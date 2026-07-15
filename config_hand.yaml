@@ -1,21 +1,37 @@
 ctrl_frequency: 50.0
 serial:
-  port: /dev/ttyUSB0
-  baudrate: 230400
+  port: COM8
+  baudrate: 500000
   timeout_s: 0.05
   write_timeout_s: 0.05
 tactile:
   enabled: true
-  port: /dev/ttyUSB1
-  baudrate: 115200
-  timeout_s: 1.0
-  contact_threshold_g: 10.0
-  channel_fingers:
-  - thumb
-  - index
-  - middle
-  - ring
-  - little
+  mode: hwk
+  fsr402:
+    port: COM8
+    baudrate: 115200
+    timeout_s: 1.0
+    contact_threshold_g: 0.1
+    channel_fingers:
+    - thumb
+    - index
+    - middle
+    - ring
+    - little
+  hwk:
+    port: COM7
+    baudrate: 921600
+    response_timeout_s: 0.2
+    write_timeout_s: 0.2
+    poll_interval_s: 0.0
+    contact_threshold_g: 1.0
+    device_regions:
+      1: thumb
+      2: index
+      3: middle
+      4: ring
+      5: little
+      6: palm
 thumb:
   cmc_1:
     id: 13

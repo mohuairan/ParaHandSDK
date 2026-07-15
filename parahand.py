@@ -10,6 +10,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 import motor
+from tactile_sensor import (
+    FSR402_MODE,
+    HWK_MODE,
+    TactileSnapshot,
+    create_tactile_sensor,
+    normalize_tactile_mode,
+)
 
 
 CONFIG_KEYS = {"ctrl_frequency", "serial", "baudrate", "tactile"}
@@ -43,13 +50,67 @@ class JointDefinition:
 
 
 @dataclass(frozen=True)
-class TactileDefinition:
-    enabled: bool
+class FSR402TactileDefinition:
     port: Optional[str]
     baudrate: int
     timeout_s: float
     channel_fingers: tuple[str, ...]
     contact_threshold_g: float
+
+
+@dataclass(frozen=True)
+class HWKTactileDefinition:
+    port: Optional[str]
+    baudrate: int
+    response_timeout_s: float
+    write_timeout_s: float
+    poll_interval_s: float
+    device_regions: tuple[tuple[int, str], ...]
+    contact_threshold_g: float
+
+    @property
+    def contact_threshold_raw(self) -> float:
+        """兼容旧字段名；华威科输出现已确认单位为 g。"""
+
+        return self.contact_threshold_g
+
+
+@dataclass(frozen=True)
+class TactileDefinition:
+    enabled: bool
+    mode: str
+    fsr402: FSR402TactileDefinition
+    hwk: HWKTactileDefinition
+
+    @property
+    def active(self) -> FSR402TactileDefinition | HWKTactileDefinition:
+        return self.fsr402 if self.mode == FSR402_MODE else self.hwk
+
+    @property
+    def port(self) -> Optional[str]:
+        return self.active.port
+
+    @property
+    def baudrate(self) -> int:
+        return self.active.baudrate
+
+    @property
+    def timeout_s(self) -> float:
+        if self.mode == FSR402_MODE:
+            return self.fsr402.timeout_s
+        return self.hwk.response_timeout_s
+
+    @property
+    def channel_fingers(self) -> tuple[str, ...]:
+        return self.fsr402.channel_fingers
+
+    @property
+    def contact_threshold_g(self) -> float:
+        """返回当前触觉模式以克为单位的接触阈值。"""
+
+        if self.mode == FSR402_MODE:
+            return self.fsr402.contact_threshold_g
+        return self.hwk.contact_threshold_g
 
 
 class ParaHand:
@@ -81,6 +142,8 @@ class ParaHand:
         self._tactile_lock = threading.Lock()
         self._tactile_sensor: Optional[Any] = None
         self._tactile_started = False
+        self._tactile_mode: Optional[str] = None
+        self._last_tactile_error: Optional[BaseException] = None
         self._rebuild_from_config(self.config)
 
     @property
@@ -91,7 +154,28 @@ class ParaHand:
     @property
     def tactile_connected(self) -> bool:
         '''返回触觉传感器后台读取线程是否已启动。'''
-        return self._tactile_started
+        with self._tactile_lock:
+            sensor = self._tactile_sensor
+        if not self._tactile_started or sensor is None:
+            return False
+        return bool(getattr(sensor, "is_running", True))
+
+    @property
+    def tactile_mode(self) -> str:
+        '''返回当前运行或配置选中的触觉传感器模式。'''
+        return self._tactile_mode or self.tactile_config.mode
+
+    @property
+    def tactile_unit(self) -> str:
+        '''返回当前模式的代表值单位。'''
+        return "g"
+
+    @property
+    def last_tactile_error(self) -> Optional[BaseException]:
+        with self._tactile_lock:
+            sensor = self._tactile_sensor
+        runtime_error = getattr(sensor, "last_error", None) if sensor is not None else None
+        return runtime_error or self._last_tactile_error
 
     def connect(self) -> bool:
         '''连接电机并注册反馈回调；触觉传感器独立启动不受电机连接影响。'''
@@ -520,67 +604,129 @@ class ParaHand:
         port: Optional[Any] = None,
         baudrate: Optional[Any] = None,
         timeout_s: Optional[Any] = None,
+        *,
+        mode: Optional[Any] = None,
     ) -> bool:
-        '''启动 FSR402 五路触觉传感器后台读取。失败时返回 False 而不抛异常。'''
-        if self._tactile_started:
+        '''按配置模式启动触觉传感器；失败时返回 False 并记录异常。'''
+        try:
+            selected_mode = normalize_tactile_mode(
+                self.tactile_config.mode if mode is None else mode
+            )
+        except Exception as exc:
+            self._last_tactile_error = exc
+            return False
+        if self.tactile_connected and self._tactile_mode == selected_mode:
             return True
+        if self._tactile_started:
+            self.stop_tactile()
 
         try:
-            sensor_class = self._load_tactile_sensor_class()
-            tactile_port = self.tactile_config.port if port is None else self._parse_tactile_port(port)
-            tactile_baudrate = self.tactile_config.baudrate if baudrate is None else self._parse_baudrate(baudrate)
-            tactile_timeout_s = (
-                self.tactile_config.timeout_s
-                if timeout_s is None
-                else self._parse_timeout(timeout_s, "tactile.timeout_s")
-            )
-
-            sensor = sensor_class(
-                port=tactile_port,
-                baudrate=tactile_baudrate,
-                timeout=tactile_timeout_s,
-            )
+            if selected_mode == FSR402_MODE:
+                config = self.tactile_config.fsr402
+                sensor = create_tactile_sensor(
+                    selected_mode,
+                    port=config.port if port is None else self._parse_tactile_port(port),
+                    baudrate=config.baudrate if baudrate is None else self._parse_baudrate(baudrate),
+                    timeout_s=(
+                        config.timeout_s
+                        if timeout_s is None
+                        else self._parse_timeout(timeout_s, "tactile.fsr402.timeout_s")
+                    ),
+                    channel_fingers=config.channel_fingers,
+                )
+            else:
+                config = self.tactile_config.hwk
+                sensor = create_tactile_sensor(
+                    selected_mode,
+                    port=config.port if port is None else self._parse_tactile_port(port),
+                    baudrate=config.baudrate if baudrate is None else self._parse_baudrate(baudrate),
+                    response_timeout_s=(
+                        config.response_timeout_s
+                        if timeout_s is None
+                        else self._parse_timeout(timeout_s, "tactile.hwk.response_timeout_s")
+                    ),
+                    write_timeout_s=config.write_timeout_s,
+                    poll_interval_s=config.poll_interval_s,
+                    device_regions=dict(config.device_regions),
+                )
             sensor.start()
-        except Exception:
+        except Exception as exc:
+            self._last_tactile_error = exc
             return False
 
         with self._tactile_lock:
             self._tactile_sensor = sensor
             self._tactile_started = True
+            self._tactile_mode = selected_mode
+            self._last_tactile_error = None
         return True
 
     def stop_tactile(self):
-        '''停止 FSR402 五路触觉传感器后台读取。'''
+        '''停止当前模式的触觉传感器后台读取。'''
         with self._tactile_lock:
             sensor = self._tactile_sensor
             self._tactile_sensor = None
             self._tactile_started = False
+            self._tactile_mode = None
 
         if sensor is not None:
             sensor.stop()
 
-    def get_tactile_forces(self) -> list[float]:
-        '''返回五根手指指尖受力数组，顺序为 thumb/index/middle/ring/little，单位 g。'''
-        frame = self.get_tactile_frame()
-        if frame is None:
+    def get_tactile_snapshot(self) -> Optional[TactileSnapshot]:
+        '''返回统一触觉快照；未启动或尚无数据时返回 None。'''
+        with self._tactile_lock:
+            sensor = self._tactile_sensor
+        if sensor is None:
+            return None
+        return sensor.read()
+
+    def get_tactile_values(self) -> list[float]:
+        '''返回五指代表值；两种触觉模式的单位均为 g。'''
+        snapshot = self.get_tactile_snapshot()
+        if snapshot is None:
             return [-1.0] * len(FINGERTIP_FORCE_ORDER)
-        return self._frame_to_fingertip_forces(frame)
+        value_map = snapshot.value_map
+        return [float(value_map.get(name, -1.0)) for name in FINGERTIP_FORCE_ORDER]
+
+    def get_tactile_forces(self) -> list[float]:
+        '''兼容旧 API；返回各指主压力矩阵的最大克重值。'''
+        return self.get_tactile_values()
 
     def get_fingertip_forces(self) -> list[float]:
         '''返回五根手指指尖受力数组，等同于 get_tactile_forces。'''
         return self.get_tactile_forces()
 
     def get_tactile_force_map(self) -> Dict[str, float]:
-        '''按手指名返回指尖受力，单位 g。'''
+        '''按手指名返回代表值；单位由 tactile_unit 指示。'''
         return dict(zip(FINGERTIP_FORCE_ORDER, self.get_tactile_forces()))
 
     def get_tactile_frame(self) -> Optional[Any]:
-        '''返回 FSR402Sensor 的最新 SensorFrame；无数据或未启动时返回 None。'''
+        '''兼容原生数据读取：FSR402 返回 SensorFrame，华威科返回设备读数字典。'''
+        snapshot = self.get_tactile_snapshot()
+        return None if snapshot is None else snapshot.raw
+
+    def get_tactile_matrices(self) -> Dict[str, Any]:
+        '''返回区域到矩阵元组的映射；适用于华威科空间压力数据。'''
+        snapshot = self.get_tactile_snapshot()
+        return {} if snapshot is None else dict(snapshot.matrices)
+
+    def get_tactile_force_summaries(self) -> Dict[str, Dict[str, float]]:
+        '''返回华威科各区域的 Fx、Fy、Fnormal_sum 汇总值，单位为 g。'''
+        snapshot = self.get_tactile_snapshot()
+        if snapshot is None:
+            return {}
+        return {
+            region: {label: float(value) for label, value in summary.items()}
+            for region, summary in snapshot.force_summaries.items()
+        }
+
+    def calibrate_tactile(self, device_id: int, command: int = 2):
+        '''向当前华威科传感器发送归零命令。'''
         with self._tactile_lock:
             sensor = self._tactile_sensor
-        if sensor is None:
-            return None
-        return sensor.read()
+        if sensor is None or self.tactile_mode != HWK_MODE:
+            raise RuntimeError("仅已启动的华威科模式支持归零校准")
+        sensor.calibrate(device_id, command)
 
     def update_joint_definition(self, joint_name: str, config_values: Any):
         '''更新指定关节的映射与运动参数。'''
@@ -645,8 +791,12 @@ class ParaHand:
         timeout_s: Any,
         channel_fingers: Optional[Any] = None,
         contact_threshold_g: Optional[float] = None,
+        mode: Optional[Any] = None,
+        device_regions: Optional[Any] = None,
+        write_timeout_s: Optional[Any] = None,
+        poll_interval_s: Optional[Any] = None,
     ):
-        '''更新触觉传感器连接参数。'''
+        '''更新选中模式的触觉传感器连接参数。'''
         new_config = copy.deepcopy(self.config)
         tactile_config = new_config.get("tactile")
         if not isinstance(tactile_config, dict):
@@ -654,14 +804,92 @@ class ParaHand:
             new_config["tactile"] = tactile_config
 
         tactile_config["enabled"] = self._parse_bool(enabled, "tactile", "enabled")
+        selected_mode = normalize_tactile_mode(
+            tactile_config.get("mode", self.tactile_config.mode) if mode is None else mode
+        )
+        tactile_config["mode"] = selected_mode
         parsed_port = self._parse_tactile_port(port)
-        tactile_config["port"] = "auto" if parsed_port is None else parsed_port
-        tactile_config["baudrate"] = self._parse_baudrate(baudrate)
-        tactile_config["timeout_s"] = self._parse_timeout(timeout_s, "tactile.timeout_s")
-        if channel_fingers is not None:
-            tactile_config["channel_fingers"] = list(self._parse_tactile_channel_fingers(channel_fingers))
-        if contact_threshold_g is not None:
-            tactile_config["contact_threshold_g"] = float(contact_threshold_g)
+
+        # 先把解析后的两套配置补齐到新结构，避免迁移旧平铺配置时丢失
+        # channel_fingers、阈值或当前未选中模式的参数。
+        current_fsr = self.tactile_config.fsr402
+        fsr_config = tactile_config.get("fsr402")
+        if not isinstance(fsr_config, dict):
+            fsr_config = {}
+            tactile_config["fsr402"] = fsr_config
+        fsr_defaults = {
+            "port": "auto" if current_fsr.port is None else current_fsr.port,
+            "baudrate": current_fsr.baudrate,
+            "timeout_s": current_fsr.timeout_s,
+            "channel_fingers": list(current_fsr.channel_fingers),
+            "contact_threshold_g": current_fsr.contact_threshold_g,
+        }
+        for key, value in fsr_defaults.items():
+            fsr_config.setdefault(key, value)
+
+        current_hwk = self.tactile_config.hwk
+        hwk_config = tactile_config.get("hwk")
+        if not isinstance(hwk_config, dict):
+            hwk_config = {}
+            tactile_config["hwk"] = hwk_config
+        hwk_defaults = {
+            "port": "auto" if current_hwk.port is None else current_hwk.port,
+            "baudrate": current_hwk.baudrate,
+            "response_timeout_s": current_hwk.response_timeout_s,
+            "write_timeout_s": current_hwk.write_timeout_s,
+            "poll_interval_s": current_hwk.poll_interval_s,
+            "device_regions": dict(current_hwk.device_regions),
+            "contact_threshold_g": current_hwk.contact_threshold_g,
+        }
+        for key, value in hwk_defaults.items():
+            hwk_config.setdefault(key, value)
+        hwk_config.pop("contact_threshold_raw", None)
+
+        if selected_mode == FSR402_MODE:
+            sensor_config = fsr_config
+            sensor_config["port"] = "auto" if parsed_port is None else parsed_port
+            sensor_config["baudrate"] = self._parse_baudrate(baudrate)
+            sensor_config["timeout_s"] = self._parse_timeout(
+                timeout_s, "tactile.fsr402.timeout_s"
+            )
+            if channel_fingers is not None:
+                sensor_config["channel_fingers"] = list(
+                    self._parse_tactile_channel_fingers(channel_fingers)
+                )
+            if contact_threshold_g is not None:
+                sensor_config["contact_threshold_g"] = float(contact_threshold_g)
+        else:
+            sensor_config = hwk_config
+            sensor_config["port"] = "auto" if parsed_port is None else parsed_port
+            sensor_config["baudrate"] = self._parse_baudrate(baudrate)
+            sensor_config["response_timeout_s"] = self._parse_timeout(
+                timeout_s, "tactile.hwk.response_timeout_s"
+            )
+            if write_timeout_s is not None:
+                sensor_config["write_timeout_s"] = self._parse_timeout(
+                    write_timeout_s, "tactile.hwk.write_timeout_s"
+                )
+            if poll_interval_s is not None:
+                sensor_config["poll_interval_s"] = self._parse_timeout(
+                    poll_interval_s, "tactile.hwk.poll_interval_s"
+                )
+            if device_regions is not None:
+                sensor_config["device_regions"] = {
+                    device_id: region
+                    for device_id, region in self._parse_hwk_device_regions(device_regions)
+                }
+            if contact_threshold_g is not None:
+                sensor_config["contact_threshold_g"] = float(contact_threshold_g)
+
+        # 保存后使用新的分模式结构；读取时仍兼容这些旧字段。
+        for legacy_key in (
+            "port",
+            "baudrate",
+            "timeout_s",
+            "channel_fingers",
+            "contact_threshold_g",
+        ):
+            tactile_config.pop(legacy_key, None)
 
         self._rebuild_from_config(new_config)
 
@@ -1123,7 +1351,7 @@ class ParaHand:
         return value
 
     def _extract_tactile_config(self, config: Dict[str, Any]) -> TactileDefinition:
-        '''提取并校验触觉传感器配置。'''
+        '''提取分模式配置，并兼容旧版平铺的 FSR402 字段。'''
         tactile_config = config.get("tactile", {})
         if tactile_config is None:
             tactile_config = {}
@@ -1131,20 +1359,93 @@ class ParaHand:
             raise ValueError("tactile 配置必须是字典")
 
         enabled = self._parse_bool(tactile_config.get("enabled", False), "tactile", "enabled")
-        port = self._parse_tactile_port(tactile_config.get("port", None))
-        baudrate = self._parse_baudrate(tactile_config.get("baudrate", 115200))
-        timeout_s = self._parse_timeout(tactile_config.get("timeout_s", 1.0), "tactile.timeout_s")
-        contact_threshold_g = float(tactile_config.get("contact_threshold_g", 10.0))
-        channel_fingers = self._parse_tactile_channel_fingers(
-            tactile_config.get("channel_fingers", FINGERTIP_FORCE_ORDER)
+        mode = normalize_tactile_mode(tactile_config.get("mode", FSR402_MODE))
+
+        fsr_config = tactile_config.get("fsr402", {})
+        if fsr_config is None:
+            fsr_config = {}
+        if not isinstance(fsr_config, dict):
+            raise ValueError("tactile.fsr402 配置必须是字典")
+        fsr402 = FSR402TactileDefinition(
+            port=self._parse_tactile_port(
+                fsr_config.get("port", tactile_config.get("port"))
+            ),
+            baudrate=self._parse_baudrate(
+                fsr_config.get("baudrate", tactile_config.get("baudrate", 115200))
+            ),
+            timeout_s=self._parse_timeout(
+                fsr_config.get("timeout_s", tactile_config.get("timeout_s", 1.0)),
+                "tactile.fsr402.timeout_s",
+            ),
+            channel_fingers=self._parse_tactile_channel_fingers(
+                fsr_config.get(
+                    "channel_fingers",
+                    tactile_config.get("channel_fingers", FINGERTIP_FORCE_ORDER),
+                )
+            ),
+            contact_threshold_g=self._parse_tactile_threshold(
+                fsr_config.get(
+                    "contact_threshold_g",
+                    tactile_config.get("contact_threshold_g", 10.0),
+                ),
+                "tactile.fsr402.contact_threshold_g",
+            ),
+        )
+
+        hwk_config = tactile_config.get("hwk", {})
+        if hwk_config is None:
+            hwk_config = {}
+        if not isinstance(hwk_config, dict):
+            raise ValueError("tactile.hwk 配置必须是字典")
+        legacy_hwk_port = tactile_config.get("port") if mode == HWK_MODE else None
+        legacy_hwk_baudrate = tactile_config.get("baudrate", 921600) if mode == HWK_MODE else 921600
+        legacy_hwk_timeout = tactile_config.get("timeout_s", 0.2) if mode == HWK_MODE else 0.2
+        response_timeout_s = self._parse_timeout(
+            hwk_config.get("response_timeout_s", legacy_hwk_timeout),
+            "tactile.hwk.response_timeout_s",
+        )
+        if response_timeout_s <= 0:
+            raise ValueError("tactile.hwk.response_timeout_s 必须大于 0")
+        hwk = HWKTactileDefinition(
+            port=self._parse_tactile_port(hwk_config.get("port", legacy_hwk_port)),
+            baudrate=self._parse_baudrate(
+                hwk_config.get("baudrate", legacy_hwk_baudrate)
+            ),
+            response_timeout_s=response_timeout_s,
+            write_timeout_s=self._parse_timeout(
+                hwk_config.get("write_timeout_s", 0.2),
+                "tactile.hwk.write_timeout_s",
+            ),
+            poll_interval_s=self._parse_timeout(
+                hwk_config.get("poll_interval_s", 0.0),
+                "tactile.hwk.poll_interval_s",
+            ),
+            device_regions=self._parse_hwk_device_regions(
+                hwk_config.get(
+                    "device_regions",
+                    {
+                        1: "thumb",
+                        2: "index",
+                        3: "middle",
+                        4: "ring",
+                        5: "little",
+                        6: "palm",
+                    },
+                )
+            ),
+            contact_threshold_g=self._parse_tactile_threshold(
+                hwk_config.get(
+                    "contact_threshold_g",
+                    hwk_config.get("contact_threshold_raw", 1.0),
+                ),
+                "tactile.hwk.contact_threshold_g",
+            ),
         )
         return TactileDefinition(
             enabled=enabled,
-            port=port,
-            baudrate=baudrate,
-            timeout_s=timeout_s,
-            channel_fingers=channel_fingers,
-            contact_threshold_g=contact_threshold_g,
+            mode=mode,
+            fsr402=fsr402,
+            hwk=hwk,
         )
 
     def _parse_tactile_port(self, port: Any) -> Optional[str]:
@@ -1169,26 +1470,38 @@ class ParaHand:
             raise ValueError(f"tactile.channel_fingers 必须包含 {list(FINGERTIP_FORCE_ORDER)}")
         return fingers
 
-    def _frame_to_fingertip_forces(self, frame: Any) -> list[float]:
-        '''将 FSR402 通道顺序转换为固定五指顺序。'''
-        forces = getattr(frame, "forces", None)
-        if forces is None:
-            return [-1.0] * len(FINGERTIP_FORCE_ORDER)
-
-        force_values = [float(value) for value in forces]
-        fingertip_forces = {finger: -1.0 for finger in FINGERTIP_FORCE_ORDER}
-        for channel, finger in enumerate(self.tactile_config.channel_fingers):
-            if channel < len(force_values):
-                fingertip_forces[finger] = force_values[channel]
-        return [fingertip_forces[finger] for finger in FINGERTIP_FORCE_ORDER]
-
-    def _load_tactile_sensor_class(self):
-        '''延迟导入 FSR402Sensor，避免未安装 pyserial 时影响电机控制。'''
+    def _parse_hwk_device_regions(self, device_regions: Any) -> tuple[tuple[int, str], ...]:
+        '''解析华威科设备 ID 到手指/掌心区域的映射。'''
         try:
-            from fsr402_sensor import FSR402Sensor
-        except ImportError as exc:
-            raise ImportError("使用触觉传感器需要先安装 pyserial，并确保 fsr402_sensor.py 可导入") from exc
-        return FSR402Sensor
+            items = device_regions.items() if isinstance(device_regions, dict) else device_regions
+            parsed = tuple((int(device_id), str(region).strip()) for device_id, region in items)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("tactile.hwk.device_regions 必须是 ID 到区域名的映射") from exc
+        if not parsed:
+            raise ValueError("tactile.hwk.device_regions 不能为空")
+        device_ids = [device_id for device_id, _ in parsed]
+        region_names = [region for _, region in parsed]
+        if any(not 1 <= device_id <= 15 for device_id in device_ids):
+            raise ValueError("华威科设备 ID 必须在 1..15 之间")
+        if len(set(device_ids)) != len(device_ids):
+            raise ValueError("华威科设备 ID 不能重复")
+        if any(not region for region in region_names):
+            raise ValueError("华威科区域名不能为空")
+        if len(set(region_names)) != len(region_names):
+            raise ValueError("华威科区域名不能重复")
+        return parsed
+
+    def _parse_tactile_threshold(self, value: Any, field_name: str) -> float:
+        threshold = float(value)
+        if threshold < 0:
+            raise ValueError(f"{field_name} 不能小于 0")
+        return threshold
 
 
-__all__ = ["ParaHand", "JointDefinition", "TactileDefinition"]
+__all__ = [
+    "FSR402TactileDefinition",
+    "HWKTactileDefinition",
+    "JointDefinition",
+    "ParaHand",
+    "TactileDefinition",
+]
