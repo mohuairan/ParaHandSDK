@@ -16,13 +16,13 @@ thumb:
     id: 14
     range:
     - -90.0
-    - 30.0
+    - 40.0
     reverse: false
     enabled: true
   mcp:
     id: 15
     range:
-    - 0.0
+    - -30.0
     - 90.0
     reverse: false
     enabled: true
@@ -37,7 +37,7 @@ index:
   mcp_1:
     id: 5
     range:
-    - -8.0
+    - -30.0
     - 0.0
     reverse: false
     enabled: true
@@ -112,8 +112,8 @@ little:
   mcp_1:
     id: 8
     range:
-    - 0
-    - 45
+    - 0.0
+    - 30.0
     reverse: false
     enabled: true
   mcp_2:
