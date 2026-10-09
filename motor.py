@@ -415,79 +415,53 @@ class Motor:
                 time.sleep(0.01)
     
     def _process_receive_buffer(self):
-        """处理接收缓冲区中的完整数据包"""
+        """Consume fixed-size frames and resynchronize after stray bytes."""
+        headers = (
+            self.FRAME_HEAD,
+            self.ANGLE_BROADCAST_HEAD1, self.ANGLE_BROADCAST_HEAD2,
+            self.SPEED_BROADCAST_HEAD1, self.SPEED_BROADCAST_HEAD2,
+            self.CURRENT_BROADCAST_HEAD1, self.CURRENT_BROADCAST_HEAD2,
+            self.ENABLE_BROADCAST_HEAD1, self.ENABLE_BROADCAST_HEAD2,
+        )
+        complete_frames = []
         with self.buffer_lock:
-            # 查找完整的帧
-            complete_frames = []
-            remaining_buffer = bytearray()
-            
-            # 查找所有帧头位置
-            frame_positions = []
-            pos = 0
-            while pos < len(self.receive_buffer) - 3:
-                if self.receive_buffer[pos:pos+4] == self.FRAME_HEAD:
-                    frame_positions.append(pos)
-                pos += 1
-            
-            if not frame_positions:
-                # 没有找到帧头，保留所有数据
-                remaining_buffer = self.receive_buffer.copy()
-            else:
-                # 处理找到的帧
-                for i, frame_start in enumerate(frame_positions):
-                    # 计算帧结束位置
-                    if i + 1 < len(frame_positions):
-                        frame_end = frame_positions[i + 1]
+            while self.receive_buffer:
+                positions = [
+                    index for header in headers
+                    if (index := self.receive_buffer.find(header)) >= 0
+                ]
+                if not positions:
+                    # Retain only a possible split header, never arbitrary noise.
+                    keep = max(
+                        (size for header in headers
+                         for size in range(1, len(header))
+                         if self.receive_buffer.endswith(header[:size])),
+                        default=0,
+                    )
+                    if keep:
+                        del self.receive_buffer[:-keep]
                     else:
-                        # 最后一个帧，检查是否有足够的数据
-                        if frame_start + 20 <= len(self.receive_buffer):
-                            frame_end = frame_start + 20  # 标准帧长度
-                        else:
-                            # 数据不完整，保留从帧头开始的所有数据
-                            frame_end = frame_start
-                    
-                    if frame_end > frame_start:
-                        # 提取完整帧
-                        frame_data = bytes(self.receive_buffer[frame_start:frame_end])
-                        if len(frame_data) == 20:  # 标准帧长度
-                            complete_frames.append(frame_data)
-                        else:
-                            # 帧不完整，保留从帧头开始的数据
-                            remaining_buffer.extend(self.receive_buffer[frame_start:])
-                            break
-                    else:
-                        # 帧不完整，保留从帧头开始的数据
-                        remaining_buffer.extend(self.receive_buffer[frame_start:])
-                        break
-                
-                # 如果第一个帧头之前有数据，也保留
-                if frame_positions[0] > 0:
-                    remaining_buffer = self.receive_buffer[:frame_positions[0]] + remaining_buffer
-            
-            # 更新缓冲区
-            self.receive_buffer = remaining_buffer
-            
-            # 处理完整的帧
-            for frame_data in complete_frames:
-                # print(f"Processing complete frame: {' '.join(f'{b:02X}' for b in frame_data)}")
-                responses = self._parse_single_frame(frame_data)
-                for response in responses:
-                    self._record_status_response(response)
-                    # 将响应放入队列
-                    self._enqueue_response(response)
-                    
-                    # 检查是否有对应的回调
-                    if response.type in self.response_callbacks:
-                        for callback in self.response_callbacks[response.type]:
-                            try:
-                                callback(response)
-                            except Exception as e:
-                                print(f"Response callback error: {e}")
-            
-            # 如果缓冲区中有不完整的数据，打印调试信息
-            if len(self.receive_buffer) > 0:
-                pass
-    
+                        self.receive_buffer.clear()
+                    break
+                start = min(positions)
+                del self.receive_buffer[:start]
+                if len(self.receive_buffer) < 20:
+                    break
+                # A header-like sequence inside the payload is not a delimiter.
+                complete_frames.append(bytes(self.receive_buffer[:20]))
+                del self.receive_buffer[:20]
+
+        # Callbacks may inspect the buffer; do not invoke them under its lock.
+        for frame in complete_frames:
+            for response in self._parse_single_frame(frame):
+                self._record_status_response(response)
+                self._enqueue_response(response)
+                for callback in tuple(self.response_callbacks.get(response.type, ())):
+                    try:
+                        callback(response)
+                    except Exception as error:
+                        print(f"Response callback error: {error}")
+
     def _send_raw(
         self,
         frame: bytes,
