@@ -1,5 +1,6 @@
 import threading
 import unittest
+from unittest.mock import patch
 
 from parahand import JointDefinition, ParaHand
 
@@ -56,6 +57,57 @@ def _make_hand():
 
 
 class ParaHandPollingTest(unittest.TestCase):
+    def test_failed_motor_does_not_pause_healthy_motor_and_can_recover(self):
+        hand = _make_hand()
+        with patch("parahand.time.monotonic", return_value=10.0):
+            hand._store_motor_status(
+                1, {"timeout": True, "cached": False, "online": False},
+            )
+            feedback = hand.poll_once()
+        self.assertEqual(set(feedback), {2})
+        self.assertEqual(hand._poll_bus_pause_until, 0.0)
+        with patch("parahand.time.monotonic", return_value=10.051):
+            feedback = hand.poll_once()
+        self.assertEqual(set(feedback), {1, 2})
+        self.assertNotIn(1, hand._poll_failure_counts)
+        self.assertNotIn(1, hand._poll_next_allowed_at)
+
+    def test_repeated_timeout_has_bounded_retry_and_preserves_feedback_age(self):
+        hand = _make_hand()
+        hand._store_motor_status(1, hand.motor._status(1))
+        with patch("parahand.time.monotonic", return_value=200.0):
+            for _ in range(1100):
+                hand._store_motor_status(
+                    1,
+                    {"timeout": True, "cached": True, "angle": 1.0},
+                )
+                self.assertLessEqual(hand._poll_next_allowed_at[1], 200.25)
+                self.assertGreaterEqual(hand._poll_next_allowed_at[1], 200.05)
+        self.assertEqual(
+            hand._motor_feedback[1]["position_updated_at_monotonic_s"], 124.0,
+        )
+
+    def test_background_exception_is_logged_and_polling_continues(self):
+        hand = _make_hand()
+        hand._poll_stop_event = threading.Event()
+        hand._poll_error_count = 0
+        hand._last_poll_error = None
+        hand._last_poll_warning_at = float("-inf")
+        calls = []
+
+        def poll():
+            calls.append(1)
+            if len(calls) == 1:
+                raise TimeoutError("send lock busy")
+            hand._poll_stop_event.set()
+
+        hand.poll_once = poll
+        with self.assertLogs("parahand", level="WARNING") as captured:
+            hand._poll_loop()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(hand._poll_error_count, 1)
+        self.assertIn("send lock busy", captured.output[0])
+
     def test_poll_next_spends_one_status_transaction_per_tick(self):
         hand = _make_hand()
 

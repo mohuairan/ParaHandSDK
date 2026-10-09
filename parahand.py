@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import re
 import threading
@@ -134,6 +135,9 @@ class ParaHand:
         self._poll_next_allowed_at: Dict[int, float] = {}
         self._poll_bus_pause_until: float = 0.0
         self._poll_cursor = 0
+        self._poll_error_count = 0
+        self._last_poll_error = None
+        self._last_poll_warning_at = float("-inf")
         self._callbacks_registered = False
         self.ctrl_frequency = self._parse_ctrl_frequency(self.config.get("ctrl_frequency", 50))
         self.joint_to_motor: Dict[str, JointDefinition] = {}
@@ -1049,15 +1053,13 @@ class ParaHand:
         if timed_out:
             failure_count = self._poll_failure_counts.get(motor_id, 0) + 1
             self._poll_failure_counts[motor_id] = failure_count
+            # Back off only this device; keep retries below the deployment
+            # freshness budget, without pausing healthy motors on the bus.
             cooldown = min(
-                max(0.5, period * 10.0) * (2 ** (failure_count - 1)),
-                5.0,
+                max(0.05, period) * (2 ** min(failure_count - 1, 3)),
+                0.25,
             )
             self._poll_next_allowed_at[motor_id] = time.monotonic() + cooldown
-            self._poll_bus_pause_until = time.monotonic() + min(
-                max(cooldown * 0.5, 0.1),
-                0.5,
-            )
         else:
             self._poll_failure_counts.pop(motor_id, None)
             self._poll_next_allowed_at.pop(motor_id, None)
@@ -1093,8 +1095,17 @@ class ParaHand:
             started_at = time.monotonic()
             try:
                 self.poll_once()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._poll_error_count += 1
+                self._last_poll_error = f"{type(exc).__name__}: {exc}"
+                now = time.monotonic()
+                if now - self._last_poll_warning_at >= 1.0:
+                    self._last_poll_warning_at = now
+                    logging.getLogger(__name__).warning(
+                        "Hand status polling failed (%d errors): %s",
+                        self._poll_error_count,
+                        self._last_poll_error,
+                    )
             elapsed = time.monotonic() - started_at
             pause_until = self._poll_bus_pause_until
             extra_wait = max(0.0, pause_until - time.monotonic()) if pause_until > 0.0 else 0.0

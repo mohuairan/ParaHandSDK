@@ -14,6 +14,7 @@ import datetime
 import queue
 from typing import Dict, Iterable, Optional, Tuple, Any
 from dataclasses import dataclass
+from contextlib import contextmanager
 from enum import Enum
 
 class CommandType(Enum):
@@ -81,6 +82,8 @@ class Motor:
     # requests. At 0.5 ms, replies are dropped and the batch reader exposes
     # stale positions even though angle commands are executed successfully.
     STATUS_QUERY_INTERVAL_S = 0.00075
+    # Lock contention is a transport fault, separate from a missing reply.
+    STATUS_LOCK_TIMEOUT_S = 0.25
     
     # 新增电机使能/失能相关的协议常量
     ENABLE_MOTOR_ID = 0xB0  # 单个电机使能/失能命令ID
@@ -117,10 +120,8 @@ class Motor:
         self.serial = None
         self.connected = False
         self.lock = threading.RLock()
-        # A status request must own the bus until its response arrives. Without
-        # this transaction lock, queued angle broadcasts can be transmitted
-        # between the request and response and make the synchronous poller
-        # consume the wrong frame or time out.
+        # Serialize query writes with queued commands, then release the bus
+        # while waiting for replies so command delivery can continue.
         self._status_transaction_lock = threading.RLock()
         self._status_batch_lock = threading.Lock()
         self._status_condition = threading.Condition()
@@ -133,6 +134,9 @@ class Motor:
         self._coalesced_motor_angle_count = 0
         self._coalesced_angle_broadcast_count = 0
         self._dropped_response_count = 0
+        self._crc_error_count = 0
+        self._status_lock_timeout_count = 0
+        self._last_status_lock_wait_s = 0.0
         self._last_motor_status: Dict[int, Dict[str, Any]] = {}
         self._last_status_warning_at: Dict[int, float] = {}
         
@@ -448,7 +452,13 @@ class Motor:
                 if len(self.receive_buffer) < 20:
                     break
                 # A header-like sequence inside the payload is not a delimiter.
-                complete_frames.append(bytes(self.receive_buffer[:20]))
+                frame = bytes(self.receive_buffer[:20])
+                if not self._frame_crc_valid(frame):
+                    self._crc_error_count += 1
+                    # A truncated packet may overlap the next valid header.
+                    del self.receive_buffer[:1]
+                    continue
+                complete_frames.append(frame)
                 del self.receive_buffer[:20]
 
         # Callbacks may inspect the buffer; do not invoke them under its lock.
@@ -641,8 +651,29 @@ class Motor:
         
         return responses
     
+    def _frame_crc_valid(self, frame: bytes) -> bool:
+        """Check the protocol-specific CRC before any feedback is published."""
+        if len(frame) != 20:
+            return False
+        if frame[:4] == self.FRAME_HEAD:
+            payload, checksum = frame[4:16], frame[16:18]
+        elif frame[:2] in (
+            self.ANGLE_BROADCAST_HEAD1, self.ANGLE_BROADCAST_HEAD2,
+            self.SPEED_BROADCAST_HEAD1, self.SPEED_BROADCAST_HEAD2,
+            self.CURRENT_BROADCAST_HEAD1, self.CURRENT_BROADCAST_HEAD2,
+            self.ENABLE_BROADCAST_HEAD1, self.ENABLE_BROADCAST_HEAD2,
+        ):
+            payload, checksum = frame[2:18], frame[18:20]
+        else:
+            return False
+        expected = int.from_bytes(checksum, "little")
+        return self._calculate_crc16_ccitt_false(payload) == expected
+
     def _parse_single_frame(self, frame_data: bytes) -> list:
         """解析单个数据帧"""
+        if not self._frame_crc_valid(frame_data):
+            self._crc_error_count += 1
+            return []
         responses = []
         
         try:
@@ -1262,6 +1293,22 @@ class Motor:
             # 尝试从响应队列获取该电机的最近状态
             return self._get_latest_motor_status(motor_id, timeout)
 
+    @contextmanager
+    def _status_query_lock(self, lock, name):
+        started_at = time.monotonic()
+        acquired = lock.acquire(timeout=self.STATUS_LOCK_TIMEOUT_S)
+        self._last_status_lock_wait_s = time.monotonic() - started_at
+        if not acquired:
+            self._status_lock_timeout_count += 1
+            raise TimeoutError(
+                f"Status query {name} lock busy for "
+                f"{self._last_status_lock_wait_s:.3f}s; request not sent"
+            )
+        try:
+            yield
+        finally:
+            lock.release()
+
     def get_motor_statuses_sync(
         self,
         motor_ids: Iterable[int],
@@ -1287,11 +1334,11 @@ class Motor:
                 for motor_id in requested
             }
 
-        with self._status_batch_lock:
-            deadline = time.monotonic() + float(timeout)
+        with self._status_query_lock(self._status_batch_lock, "batch"):
             generations: Dict[int, int] = {}
             sent_at: Dict[int, float] = {}
-            with self._status_transaction_lock:
+            deadlines: Dict[int, float] = {}
+            with self._status_query_lock(self._status_transaction_lock, "send"):
                 for motor_id in requested:
                     with self._status_condition:
                         generations[motor_id] = (
@@ -1304,6 +1351,9 @@ class Motor:
                         frame,
                         post_write_delay_s=self.STATUS_QUERY_INTERVAL_S,
                     )
+                    # Give every query its full reply budget after sending.
+                    # Lock wait and other motors' writes consume none of it.
+                    deadlines[motor_id] = time.monotonic() + float(timeout)
 
             fresh: Dict[int, Dict[str, Any]] = {}
             with self._status_condition:
@@ -1316,12 +1366,17 @@ class Motor:
                         ) <= generations[motor_id]:
                             continue
                         status = self._latest_status_response[motor_id]
-                        if status["received_at_monotonic_s"] < sent_at[motor_id]:
+                        received_at = status["received_at_monotonic_s"]
+                        if not sent_at[motor_id] <= received_at <= deadlines[motor_id]:
                             continue
                         fresh[motor_id] = dict(status)
                     if len(fresh) == len(requested):
                         break
-                    remaining_s = deadline - time.monotonic()
+                    remaining_s = max(
+                        deadlines[motor_id]
+                        for motor_id in requested
+                        if motor_id not in fresh
+                    ) - time.monotonic()
                     if remaining_s <= 0.0:
                         break
                     self._status_condition.wait(remaining_s)
@@ -1867,6 +1922,9 @@ class Motor:
             'response_queue_size': self.response_queue.qsize(),
             'response_queue_capacity': self.response_queue.maxsize,
             'dropped_response_count': self._dropped_response_count,
+            'crc_error_count': self._crc_error_count,
+            'status_lock_timeout_count': self._status_lock_timeout_count,
+            'last_status_lock_wait_s': self._last_status_lock_wait_s,
             'receive_buffer_size': len(self.receive_buffer),
             'pending_motor_angle_count': len(self._pending_motor_angles),
             'pending_angle_broadcast_count': int(
