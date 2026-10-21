@@ -1065,6 +1065,9 @@ class ParaHand:
             self._poll_next_allowed_at.pop(motor_id, None)
         with self._feedback_lock:
             self._get_feedback_entry(motor_id).update(feedback_update)
+        trace = getattr(self.motor, "_trace_event", None)
+        if trace is not None:
+            trace("feedback_store", motor_id=motor_id, **feedback_update)
         return feedback_update, timed_out
 
     def start_polling(self):
